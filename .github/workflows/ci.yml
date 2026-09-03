@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: xcodebuild -project ios/Sync.md.xcodeproj -scheme Sync.md -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+      - name: Unit tests
+        run: xcodebuild test -project ios/Sync.md.xcodeproj -scheme Sync.md -destination 'platform=iOS Simulator,OS=latest,name=iPhone 17 Pro' -only-testing:SyncMDTests
+      - name: Secret and private-path guard
+        run: |
+          ! git grep -nE '(BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|/Users/[^/]+/)' -- ':!*.xcstrings'
+      - name: Verify notices
+        run: test -s LICENSE && test -s ios/GITSYNCMD_LICENSE && test -s THIRD_PARTY_NOTICES.md

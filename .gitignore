@@ -1,0 +1,11 @@
+.DS_Store
+DerivedData/
+build/
+release/
+*.xcarchive
+*.ipa
+*.dSYM.zip
+*.mobileprovision
+Local.xcconfig
+xcuserdata/
+.swiftpm/

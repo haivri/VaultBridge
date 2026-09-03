@@ -1,0 +1,134 @@
+import Foundation
+
+/// Configuration and state for a single managed repository
+struct RepoConfig: Codable, Identifiable, Equatable {
+    let id: UUID
+    var repoURL: String
+    var branch: String
+    var authorName: String
+    var authorEmail: String
+    var vaultFolderName: String
+    var customVaultBookmarkData: Data?
+    /// When `true`, the custom vault bookmark points to a parent directory
+    /// and `vaultFolderName` should be appended to form the actual repo path.
+    /// This mirrors `git clone` behaviour: clone into `<parent>/<repoName>/`.
+    var customLocationIsParent: Bool
+    var authMethod: GitAuthMethod
+    var authUsername: String
+    /// GitHub login whose OAuth/PAT token should be used for `.gitHubPAT` remotes.
+    /// `nil` means the repo is not tied to a specific GitHub account (or is legacy data).
+    var gitHubAccountLogin: String?
+    var gitState: GitState
+    /// VaultBridge foreground automation. Manual Git controls remain available
+    /// regardless of this setting.
+    var autoSyncEnabled: Bool
+    /// Local notifications for meaningful automatic-sync outcomes. This is
+    /// intentionally opt-in because iOS notification permission is app-wide.
+    var syncNotificationsEnabled: Bool
+    /// Optional Premium automation policy. Defaults disabled for legacy records.
+    var assist: RepoAssistSettings
+
+    init(
+        id: UUID = UUID(),
+        repoURL: String,
+        branch: String,
+        authorName: String,
+        authorEmail: String,
+        vaultFolderName: String,
+        customVaultBookmarkData: Data? = nil,
+        customLocationIsParent: Bool = false,
+        authMethod: GitAuthMethod? = nil,
+        authUsername: String = "",
+        gitHubAccountLogin: String? = nil,
+        gitState: GitState = .empty,
+        autoSyncEnabled: Bool = true,
+        syncNotificationsEnabled: Bool = false,
+        assist: RepoAssistSettings = .disabled
+    ) {
+        self.id = id
+        self.repoURL = repoURL
+        self.branch = branch
+        self.authorName = authorName
+        self.authorEmail = authorEmail
+        self.vaultFolderName = vaultFolderName
+        self.customVaultBookmarkData = customVaultBookmarkData
+        self.customLocationIsParent = customLocationIsParent
+        if let authMethod {
+            self.authMethod = authMethod
+        } else if let remote = GitRemoteURL.parse(repoURL), remote.isGitHub && !remote.isSSH {
+            self.authMethod = .gitHubPAT
+        } else {
+            self.authMethod = .none
+        }
+        self.authUsername = authUsername
+        self.gitHubAccountLogin = gitHubAccountLogin
+        self.gitState = gitState
+        self.autoSyncEnabled = autoSyncEnabled
+        self.syncNotificationsEnabled = syncNotificationsEnabled
+        self.assist = assist
+    }
+
+    // MARK: - Codable (backward-compatible)
+
+    private enum CodingKeys: String, CodingKey {
+        case id, repoURL, branch, authorName, authorEmail
+        case vaultFolderName, customVaultBookmarkData
+        case customLocationIsParent, authMethod, authUsername, gitHubAccountLogin, gitState, autoSyncEnabled, syncNotificationsEnabled, assist
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id                      = try c.decode(UUID.self, forKey: .id)
+        repoURL                 = try c.decode(String.self, forKey: .repoURL)
+        branch                  = try c.decode(String.self, forKey: .branch)
+        authorName              = try c.decode(String.self, forKey: .authorName)
+        authorEmail             = try c.decode(String.self, forKey: .authorEmail)
+        vaultFolderName         = try c.decode(String.self, forKey: .vaultFolderName)
+        customVaultBookmarkData = try c.decodeIfPresent(Data.self, forKey: .customVaultBookmarkData)
+        customLocationIsParent  = try c.decodeIfPresent(Bool.self, forKey: .customLocationIsParent) ?? false
+        if let decodedAuthMethod = try c.decodeIfPresent(GitAuthMethod.self, forKey: .authMethod) {
+            authMethod = decodedAuthMethod
+        } else if let remote = GitRemoteURL.parse(repoURL), remote.isGitHub && !remote.isSSH {
+            authMethod = .gitHubPAT
+        } else {
+            authMethod = .none
+        }
+        authUsername            = try c.decodeIfPresent(String.self, forKey: .authUsername) ?? ""
+        gitHubAccountLogin      = try c.decodeIfPresent(String.self, forKey: .gitHubAccountLogin)
+        gitState                = try c.decode(GitState.self, forKey: .gitState)
+        autoSyncEnabled         = try c.decodeIfPresent(Bool.self, forKey: .autoSyncEnabled) ?? true
+        syncNotificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .syncNotificationsEnabled) ?? false
+        assist                  = try c.decodeIfPresent(RepoAssistSettings.self, forKey: .assist) ?? .disabled
+    }
+
+    // MARK: - Computed
+
+    var displayName: String {
+        GitRemoteURL.parse(repoURL)?.repoName ?? vaultFolderName
+    }
+
+    var ownerName: String? {
+        GitRemoteURL.parse(repoURL)?.ownerName
+    }
+
+    /// `true` when GitSync.md was pointed at an existing folder instead of a
+    /// repository folder it created or cloned. Removing these repos must not
+    /// delete the underlying Files folder, because it may be owned by another
+    /// app such as PolyGit.
+    var isExternalLocalRepository: Bool {
+        customVaultBookmarkData != nil && !customLocationIsParent
+    }
+
+    var isGitSyncManagedStorage: Bool {
+        !isExternalLocalRepository
+    }
+
+    var isCloned: Bool {
+        !gitState.commitSHA.isEmpty
+    }
+
+    var defaultVaultURL: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return docs.appendingPathComponent(vaultFolderName, isDirectory: true)
+    }
+}
