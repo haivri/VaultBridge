@@ -966,6 +966,10 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
 
         switch plan.action {
         case .upToDate:
+            let lfsResult = try await Self.hydrateLFSIfNeeded(localURL: localURL, pat: pat)
+            if lfsResult.checkedOutCount > 0 {
+                DebugLogger.shared.info("lfs", "Restored Git LFS files while already up to date", detail: "\(lfsResult.checkedOutCount) files")
+            }
             return LocalPullResult(updated: false, newCommitSHA: plan.localCommitSHA)
         case .blockedByLocalChanges:
             throw LocalGitError.pullBlockedByLocalChanges
@@ -1009,7 +1013,13 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                     pullResult: nil
                 )
             }
-        case .upToDate, .blockedByLocalChanges, .diverged, .remoteBranchMissing:
+        case .upToDate:
+            let lfsResult = try await Self.hydrateLFSIfNeeded(localURL: localURL, pat: pat)
+            if lfsResult.checkedOutCount > 0 {
+                DebugLogger.shared.info("lfs", "Restored Git LFS files while already up to date", detail: "\(lfsResult.checkedOutCount) files")
+            }
+            return PullExecutionResult(plan: plan, pullResult: nil)
+        case .blockedByLocalChanges, .diverged, .remoteBranchMissing:
             return PullExecutionResult(plan: plan, pullResult: nil)
         }
     }
@@ -3125,15 +3135,7 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             defer { if let index { git_index_free(index) } }
             try git2Check(git_repository_index(&index, repo), context: "Get index")
 
-            try git2Check(
-                git_index_add_all(index, nil, UInt32(GIT_INDEX_ADD_DEFAULT.rawValue), nil, nil),
-                context: "Stage all added/modified files"
-            )
-
-            try git2Check(
-                git_index_update_all(index, nil, nil, nil),
-                context: "Stage tracked deletions/modifications"
-            )
+            try Self.addAllAndUpdateAllIgnoringEviction(repo: repo, index: index)
 
             try GitLFSService.cleanAndStageLFSFiles(
                 repo: repo,
@@ -3142,6 +3144,79 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             )
 
             try git2Check(git_index_write(index), context: "Write index")
+        }.value
+    }
+
+    /// `git add -A` through libgit2's own passes, minus iCloud eviction noise:
+    /// placeholders are never added and evicted originals are never removed.
+    private static func addAllAndUpdateAllIgnoringEviction(repo: OpaquePointer?, index: OpaquePointer?) throws {
+        let workdir = git_repository_workdir(repo).map { String(cString: $0) } ?? ""
+        let context = EvictionCallbackContext(workdirURL: URL(fileURLWithPath: workdir, isDirectory: true))
+        let payload = Unmanaged.passRetained(context).toOpaque()
+        defer { Unmanaged<EvictionCallbackContext>.fromOpaque(payload).release() }
+
+        // Both passes can remove a missing tracked file (add_all mirrors
+        // `git add -A`), so both get the same eviction filter.
+        try git2Check(
+            git_index_add_all(index, nil, UInt32(GIT_INDEX_ADD_DEFAULT.rawValue), skipICloudEvictionCallback, payload),
+            context: "Stage all added/modified files"
+        )
+        try git2Check(
+            git_index_update_all(index, nil, skipICloudEvictionCallback, payload),
+            context: "Stage tracked deletions/modifications"
+        )
+    }
+
+    func rebuildIndexFromWorkingTree(lfsAutoTrack: Bool) async throws {
+        let repoPath = self.localURL.path
+
+        try await Task.detached {
+            var repo: OpaquePointer?
+            defer { if let repo { git_repository_free(repo) } }
+            try git2Check(git_repository_open(&repo, repoPath), context: "Open repo")
+            Self.setPrecomposeUnicode(repo: repo)
+
+            var index: OpaquePointer?
+            defer { if let index { git_index_free(index) } }
+            try git2Check(git_repository_index(&index, repo), context: "Get index")
+            if git_index_has_conflicts(index) == 1 {
+                throw LocalGitError.conflictSessionInProgress(.none)
+            }
+
+            // Start from the last commit so entries that only ever existed
+            // in the index (a staged file that was later deleted, an entry
+            // written by another tool) are discarded instead of preserved.
+            var headRef: OpaquePointer?
+            defer { if let headRef { git_reference_free(headRef) } }
+            let headCode = git_repository_head(&headRef, repo)
+            if headCode == 0, let headOid = git_reference_target(headRef) {
+                var headOidCopy = headOid.pointee
+                var headCommit: OpaquePointer?
+                defer { if let headCommit { git_commit_free(headCommit) } }
+                try git2Check(git_commit_lookup(&headCommit, repo, &headOidCopy), context: "Lookup HEAD commit")
+                var headTree: OpaquePointer?
+                defer { if let headTree { git_tree_free(headTree) } }
+                try git2Check(git_commit_tree(&headTree, headCommit), context: "Get HEAD tree")
+                try git2Check(git_index_read_tree(index, headTree), context: "Reset index to HEAD")
+            } else if headCode == GIT_EUNBORNBRANCH.rawValue || headCode == GIT_ENOTFOUND.rawValue {
+                try git2Check(git_index_clear(index), context: "Clear index")
+            } else {
+                try git2Check(headCode, context: "Read HEAD")
+            }
+
+            // update_all walks the index entries against the disk (deletions
+            // and edits of tracked files, by raw path bytes); add_all walks
+            // the disk for untracked files, honoring .gitignore. Evicted
+            // iCloud files stay as committed.
+            try Self.addAllAndUpdateAllIgnoringEviction(repo: repo, index: index)
+
+            try GitLFSService.cleanAndStageLFSFiles(
+                repo: repo,
+                index: index,
+                autoTrackingPolicy: lfsAutoTrack ? .default : .disabled
+            )
+
+            try git2Check(git_index_write(index), context: "Write rebuilt index")
         }.value
     }
 
@@ -3159,33 +3234,46 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             defer { if let index { git_index_free(index) } }
             try git2Check(git_repository_index(&index, repo), context: "Get index")
 
+            let workdirURL = git_repository_workdir(repo).map {
+                URL(fileURLWithPath: String(cString: $0), isDirectory: true)
+            }
             for entry in entries {
-                try entry.path.withCString { cPath in
+                if ICloudEviction.isPlaceholder(path: entry.path) { continue }
+                try entry.stagingPath.withCString { cPath in
                     let addCode = git_index_add_bypath(index, cPath)
                     if addCode == GIT_ENOTFOUND.rawValue {
-                        let removeCode = git_index_remove_bypath(index, cPath)
-                        if removeCode != 0 && removeCode != GIT_ENOTFOUND.rawValue {
-                            try git2Check(removeCode, context: "Stage deletion")
+                        // An evicted iCloud file is not a deletion; keep the
+                        // committed copy untouched.
+                        if let workdirURL, ICloudEviction.isEvicted(path: entry.path, in: workdirURL) {
+                            return
                         }
+                        try Self.removeIndexEntry(path: entry.path, index: index)
                     } else {
                         try git2Check(addCode, context: "Stage changed path")
+                        // Any other entry for the same file (a different
+                        // Unicode form, or a duplicate) must not survive as a
+                        // permanent "deleted" twin.
+                        for raw in Self.rawIndexPaths(matching: entry.path, index: index) where !Self.sameBytes(raw, entry.stagingPath) {
+                            _ = raw.withCString { git_index_remove_bypath(index, $0) }
+                        }
                     }
                 }
 
                 if let oldPath = entry.oldPath, oldPath != entry.path {
-                    try oldPath.withCString { cOldPath in
-                        let removeCode = git_index_remove_bypath(index, cOldPath)
-                        if removeCode != 0 && removeCode != GIT_ENOTFOUND.rawValue {
-                            try git2Check(removeCode, context: "Stage renamed path")
-                        }
-                    }
+                    try Self.removeIndexEntry(path: oldPath, index: index)
                 }
             }
 
             try GitLFSService.cleanAndStageLFSFiles(
                 repo: repo,
                 index: index,
-                candidatePaths: entries.map(\.path),
+                // `path` is NFC-normalized for display.  AutoNoteMover and
+                // other iOS file providers can leave the actual directory
+                // entry in another Unicode byte form, recorded in
+                // `stagingPath`.  Cleaning the display spelling misses that
+                // file, leaves a regular blob/deleted twin in the index, and
+                // every subsequent save reports the move again.
+                candidatePaths: Array(Set(entries.flatMap { [$0.path, $0.stagingPath] })),
                 autoTrackingPolicy: lfsAutoTrack ? .default : .disabled
             )
             try git2Check(git_index_write(index), context: "Write index")
@@ -3226,14 +3314,14 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             try path.withCString { cPath in
                 let addCode = git_index_add_bypath(index, cPath)
                 if addCode == GIT_ENOTFOUND.rawValue {
-                    let removeCode = git_index_remove_bypath(index, cPath)
-                    // GIT_ENOTFOUND on remove means the path was never tracked —
-                    // nothing to stage, not a real error.
-                    if removeCode != GIT_ENOTFOUND.rawValue {
-                        try git2Check(removeCode, context: "Stage deletion of \(path)")
-                    }
+                    // Missing on disk: record the deletion, resolving the index
+                    // entry by canonical path if the bytes differ.
+                    try Self.removeIndexEntry(path: path, index: index)
                 } else {
                     try git2Check(addCode, context: "Stage \(path)")
+                    for raw in Self.rawIndexPaths(matching: path, index: index) where !Self.sameBytes(raw, path) {
+                        _ = raw.withCString { git_index_remove_bypath(index, $0) }
+                    }
                 }
             }
 
@@ -3241,12 +3329,7 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             // this, the commit keeps the HEAD blob at the old path alongside
             // the newly-added blob at the new path.
             if let oldPath, oldPath != path {
-                try oldPath.withCString { cOldPath in
-                    let removeCode = git_index_remove_bypath(index, cOldPath)
-                    if removeCode != 0 && removeCode != GIT_ENOTFOUND.rawValue {
-                        try git2Check(removeCode, context: "Stage removal of renamed old path \(oldPath)")
-                    }
-                }
+                try Self.removeIndexEntry(path: oldPath, index: index)
             }
 
             try GitLFSService.cleanAndStageLFSFiles(
@@ -3329,7 +3412,10 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             defer { if let index { git_index_free(index) } }
             try git2Check(git_repository_index(&index, repo), context: "Get index")
 
-            // Check whether the file is tracked (has an index entry or exists in HEAD)
+            // Check whether the file is tracked (has an index entry or exists
+            // in HEAD). The status path is NFC-normalized; the index entry may
+            // hold another Unicode form, so resolve the raw bytes first.
+            let path = Self.rawIndexPaths(matching: path, index: index).first ?? path
             let existsInIndex = path.withCString { cPath in
                 git_index_get_bypath(index, cPath, 0) != nil
             }
@@ -4004,20 +4090,14 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
 
             let commitSHA = oidToHex(&commitOid)
 
-            var lfsPointerPaths = stagedPaths
-            var pushHeadRef: OpaquePointer?
-            if git_repository_head(&pushHeadRef, repo) == 0, let pushHeadRef {
-                defer { git_reference_free(pushHeadRef) }
-                let pushedPaths = try Self.pushedChangePaths(repo: repo, headRef: pushHeadRef)
-                if !pushedPaths.isEmpty {
-                    lfsPointerPaths = pushedPaths
-                }
-            }
-
+            // Ask the LFS server about every pointer in the current snapshot,
+            // not only files changed by this commit. This opportunistically
+            // repairs older pointers whose backing object never reached the
+            // server and blocks the Git ref update if the local object is gone.
             let lfsPointers = try GitLFSService.pointersInIndex(
                 repo: repo,
                 index: index,
-                candidatePaths: lfsPointerPaths
+                candidatePaths: nil
             )
             if !lfsPointers.isEmpty {
                 let uploaded = try await GitLFSService(
@@ -4151,16 +4231,14 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                 credentials: GitRemoteCredentials.fromTransportPayload(pat)
             ).verifyPushAllowed(changedPaths: pushedPaths, refName: "refs/heads/\(branchName)")
 
-            let lfsPointers: [GitLFSPointer]
-            if pushedPaths.isEmpty {
-                lfsPointers = []
-            } else {
-                lfsPointers = try GitLFSService.pointersInIndex(
-                    repo: repo,
-                    index: index,
-                    candidatePaths: pushedPaths
-                )
-            }
+            // Verify the complete current LFS snapshot before every branch
+            // push. A server-side hole from an older app build must not remain
+            // invisible just because the affected path did not change today.
+            let lfsPointers = try GitLFSService.pointersInIndex(
+                repo: repo,
+                index: index,
+                candidatePaths: nil
+            )
             if !lfsPointers.isEmpty {
                 let uploaded = try await GitLFSService(
                     localURL: URL(fileURLWithPath: path, isDirectory: true),
@@ -4485,6 +4563,38 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             GitInspectionProfiler.signposter.endInterval("inspection", inspectionState)
             throw error
         }
+    }
+
+    /// Repairs missing server-side LFS payloads without touching Git history.
+    /// The batch API returns upload actions only for objects Forgejo lacks, so
+    /// this remains cheap once the repository is healthy.
+    func backfillLFSObjects(pat: String) async throws -> GitLFSBackfillResult {
+        let path = self.localURL.path
+        return try await Task.detached {
+            var repo: OpaquePointer?
+            defer { if let repo { git_repository_free(repo) } }
+            try git2Check(git_repository_open(&repo, path), context: "Open repo for LFS repair")
+
+            var index: OpaquePointer?
+            defer { if let index { git_index_free(index) } }
+            try git2Check(git_repository_index(&index, repo), context: "Open index for LFS repair")
+
+            let pointers = try GitLFSService.pointersInIndex(
+                repo: repo,
+                index: index,
+                candidatePaths: nil
+            )
+            guard !pointers.isEmpty else { return .empty }
+
+            let uploaded = try await GitLFSService(
+                localURL: URL(fileURLWithPath: path, isDirectory: true),
+                credentials: GitRemoteCredentials.fromTransportPayload(pat)
+            ).uploadObjects(pointers)
+            return GitLFSBackfillResult(
+                referencedCount: pointers.count,
+                uploadedCount: uploaded
+            )
+        }.value
     }
 
     // MARK: - Fetch Remote
@@ -4901,12 +5011,15 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
         var entryFilterSeconds: TimeInterval = 0
         var lfsCleanSkipped = 0
         var spuriousRenameSkipped = 0
+        var evictedSkipped = 0
+        var spellingMismatches = 0
         defer {
             if let profile {
                 profile.metrics.statusListSeconds += statusListSeconds
                 profile.metrics.entryFilterSeconds += entryFilterSeconds
                 profile.metrics.lfsCleanSkippedCount += lfsCleanSkipped
                 profile.metrics.spuriousRenameSkippedCount += spuriousRenameSkipped
+                profile.metrics.evictedSkippedCount += evictedSkipped
             }
         }
 
@@ -4938,6 +5051,13 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
         profile?.metrics.rawStatusEntryCount += entryCount
         var entries: [GitStatusEntry] = []
         entries.reserveCapacity(entryCount)
+        // Some iOS File Provider repositories make libgit2 emit an exact-path
+        // delete+new pair even though the stage-0 blob and the file are byte
+        // identical. Remember those paths so neither half becomes a fake
+        // checkpoint.
+        var logicallyCleanPaths = Set<String>()
+        /// Raw (un-normalized) path per appended entry, for twin merging below.
+        var rawPaths: [String] = []
 
         for index in 0..<entryCount {
             guard let entryPtr = git_status_byindex(statusList, index) else { continue }
@@ -5031,22 +5151,182 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                 continue
             }
 
+            // iCloud Drive eviction is not a user change: the placeholder
+            // is not a new note and the evicted original is not a deletion.
+            if let repositoryURL {
+                if effectiveFlags & GIT_STATUS_WT_NEW.rawValue != 0,
+                   ICloudEviction.isPlaceholder(path: path) {
+                    evictedSkipped += 1
+                    continue
+                }
+                if effectiveFlags & GIT_STATUS_WT_DELETED.rawValue != 0,
+                   ICloudEviction.isEvicted(path: path, in: repositoryURL) {
+                    evictedSkipped += 1
+                    continue
+                }
+            }
+
+            // "Deleted" while the file is on disk means the index holds the
+            // name in another Unicode form than the filesystem. That is a
+            // rename of the entry, not a deletion of the note. Carry the raw
+            // index form as oldPath so staging replaces the entry.
+            var normalizationOldPath: String? = nil
+            var diskRawPath: String? = nil
+            var displayPath: String? = nil
+            let normalizedPath = path.precomposedStringWithCanonicalMapping
+            if logicallyCleanPaths.contains(normalizedPath) {
+                continue
+            }
+            // Do not use `fileExists(atPath: normalizedPath)` as the presence
+            // test.  The local Files provider can be byte-sensitive even when
+            // Foundation strings compare canonically, so an NFC lookup can
+            // return false while the NFD directory entry is plainly present.
+            // Resolve the real spelling one component at a time instead.
+            let storedDiskPath = repositoryURL.flatMap {
+                workdirStoredForm(of: normalizedPath, in: $0)
+            }
+            if effectiveFlags & GIT_STATUS_WT_DELETED.rawValue != 0,
+               mapIndexStatus(effectiveFlags) == nil,
+               let repositoryURL,
+               let storedDiskPath {
+                let storedNormalizedPath = storedDiskPath.precomposedStringWithCanonicalMapping
+                if sameBytes(storedDiskPath, normalizedPath),
+                   workdirFileMatchesIndexBlob(
+                       repo: repo,
+                       index: lfsIndex,
+                       repositoryURL: repositoryURL,
+                       indexPath: path,
+                       diskPath: storedDiskPath
+                   ) {
+                    logicallyCleanPaths.insert(normalizedPath)
+                    DebugLogger.shared.info(
+                        "status",
+                        "Ignored identical file-provider delete/add pair",
+                        detail: GitLFSService.diagnosticSummary(
+                            repositoryURL: repositoryURL,
+                            index: lfsIndex,
+                            path: normalizedPath
+                        )
+                    )
+                    continue
+                }
+                effectiveFlags &= ~GIT_STATUS_WT_DELETED.rawValue
+                effectiveFlags |= GIT_STATUS_WT_RENAMED.rawValue
+                let differsBeyondUnicodeNormalization = storedNormalizedPath != normalizedPath
+                // The raw bytes of the index entry and of the on-disk name
+                // are what staging must reconcile; the reported path is only
+                // one view of them.
+                normalizationOldPath = differsBeyondUnicodeNormalization
+                    ? path
+                    : rawIndexPaths(matching: normalizedPath, index: lfsIndex)
+                        .first(where: { !sameBytes($0, normalizedPath) })
+                // With precomposeunicode enabled, hand libgit2 the NFC form
+                // so the index converges instead of preserving the stale NFD
+                // spelling. Case-only (or other non-Unicode) differences must
+                // instead use the spelling actually present on disk; otherwise
+                // a case-insensitive Files provider can alternate one file
+                // forever between deleted and untracked.
+                diskRawPath = precomposeUnicodeEnabled(repo: repo) && !differsBeyondUnicodeNormalization
+                    ? normalizedPath
+                    : storedDiskPath
+                displayPath = storedNormalizedPath
+                spellingMismatches += 1
+                DebugLogger.shared.info(
+                    "status",
+                    "File reported deleted but present on disk",
+                    detail: "index=\(unicodeForm(normalizationOldPath ?? path)) disk=\(unicodeForm(diskRawPath ?? path))"
+                        + " same-spelling=\(!differsBeyondUnicodeNormalization)"
+                        + " precompose=\(precomposeUnicodeEnabled(repo: repo))"
+                        + " " + GitLFSService.diagnosticSummary(repositoryURL: repositoryURL, index: lfsIndex, path: normalizedPath)
+                )
+            } else if effectiveFlags & (GIT_STATUS_WT_NEW.rawValue | GIT_STATUS_WT_MODIFIED.rawValue | GIT_STATUS_WT_TYPECHANGE.rawValue) != 0 {
+                diskRawPath = path
+            }
+
             entries.append(
                 GitStatusEntry(
                     // Normalise to NFC so paths from git objects (NFC) and
                     // from the APFS/HFS+ filesystem (NFD) compare equal.
                     // Without this, Korean/CJK filenames show as perpetually
                     // modified and never match UI path lookups.
-                    path: path.precomposedStringWithCanonicalMapping,
+                    path: displayPath ?? normalizedPath,
                     indexStatus: mapIndexStatus(effectiveFlags),
                     workTreeStatus: mapWorkTreeStatus(effectiveFlags),
-                    oldPath: isFakeRename ? nil : oldPath?.precomposedStringWithCanonicalMapping
+                    oldPath: normalizationOldPath ?? (isFakeRename ? nil : oldPath?.precomposedStringWithCanonicalMapping),
+                    rawPath: diskRawPath.flatMap { sameBytes($0, normalizedPath) ? nil : $0 }
                 )
             )
+            rawPaths.append(path)
         }
 
-        profile?.metrics.reportedEntryCount += entries.count
-        return entries
+        // Two entries whose paths are canonically equal are one file seen
+        // through two Unicode forms: the index holds one, the disk the other.
+        // Report it once, as a rename from the raw index form, so staging
+        // replaces the old entry instead of leaving a permanent "deleted" twin.
+        var merged: [GitStatusEntry] = []
+        var mergedRaw: [String] = []
+        var positionByPath: [String: Int] = [:]
+        for (offset, entry) in entries.enumerated() {
+            let raw = rawPaths[offset]
+            guard let existing = positionByPath[entry.path] else {
+                positionByPath[entry.path] = merged.count
+                merged.append(entry)
+                mergedRaw.append(raw)
+                continue
+            }
+            let previous = merged[existing]
+            let previousRaw = mergedRaw[existing]
+            let deletedRaw: String?
+            if previous.workTreeStatus == .deleted, entry.workTreeStatus != .deleted {
+                deletedRaw = previousRaw
+            } else if entry.workTreeStatus == .deleted, previous.workTreeStatus != .deleted {
+                deletedRaw = raw
+            } else {
+                deletedRaw = nil
+            }
+            if let deletedRaw {
+                let diskRaw = sameBytes(deletedRaw, previousRaw) ? raw : previousRaw
+                spellingMismatches += 1
+                DebugLogger.shared.info(
+                    "status",
+                    "Spelling mismatch between index and disk (two entries)",
+                    detail: "index=\(unicodeForm(deletedRaw)) disk=\(unicodeForm(diskRaw))"
+                )
+                merged[existing] = GitStatusEntry(
+                    path: entry.path,
+                    indexStatus: nil,
+                    workTreeStatus: .renamed,
+                    oldPath: sameBytes(deletedRaw, entry.path) ? nil : deletedRaw,
+                    rawPath: sameBytes(diskRaw, entry.path) ? nil : diskRaw
+                )
+            } else if previous.oldPath != nil || entry.oldPath != nil {
+                // One half was a tracked spelling that still exists on disk
+                // under the other half's spelling. Prefer the semantic rename
+                // over whichever raw entry (often WT_NEW) libgit2 listed first.
+                merged[existing] = GitStatusEntry(
+                    path: entry.path,
+                    indexStatus: previous.indexStatus ?? entry.indexStatus,
+                    workTreeStatus: .renamed,
+                    oldPath: previous.oldPath ?? entry.oldPath,
+                    rawPath: previous.rawPath ?? entry.rawPath
+                )
+            } else {
+                merged[existing] = GitStatusEntry(
+                    path: entry.path,
+                    indexStatus: previous.indexStatus ?? entry.indexStatus,
+                    workTreeStatus: previous.workTreeStatus ?? entry.workTreeStatus,
+                    oldPath: previous.oldPath ?? entry.oldPath,
+                    rawPath: previous.rawPath ?? entry.rawPath
+                )
+            }
+        }
+
+        if !logicallyCleanPaths.isEmpty {
+            merged.removeAll { logicallyCleanPaths.contains($0.path) }
+        }
+        profile?.metrics.reportedEntryCount += merged.count
+        profile?.metrics.spellingMismatchCount += spellingMismatches
+        return merged
     }
 
     private static func mapIndexStatus(_ flags: UInt32) -> GitFileStatusKind? {
@@ -5111,4 +5391,156 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
         }
         return count
     }
+}
+
+
+// MARK: - Raw index path resolution
+
+extension LocalGitService {
+    /// Swift `==` on String is canonical-equivalence, which is exactly the
+    /// wrong test when the whole point is that two byte sequences differ.
+    fileprivate static func sameBytes(_ a: String, _ b: String) -> Bool {
+        a.utf8.elementsEqual(b.utf8)
+    }
+
+    /// Status entries carry NFC-normalized paths so the UI can match them,
+    /// but index entries written by other tools may hold the same name in a
+    /// different Unicode form. `git_index_remove_bypath` and friends need the
+    /// exact bytes, so resolve them by scanning for canonically equal paths.
+    fileprivate static func rawIndexPaths(matching normalizedPath: String, index: OpaquePointer?) -> [String] {
+        let wanted = normalizedPath.precomposedStringWithCanonicalMapping
+        var matches: [String] = []
+        let count = git_index_entrycount(index)
+        for i in 0..<count {
+            guard let entry = git_index_get_byindex(index, i), let cPath = entry.pointee.path else { continue }
+            let raw = String(cString: cPath)
+            if raw.precomposedStringWithCanonicalMapping == wanted {
+                matches.append(raw)
+            }
+        }
+        return matches
+    }
+
+    fileprivate static func precomposeUnicodeEnabled(repo: OpaquePointer?) -> Bool {
+        var config: OpaquePointer?
+        defer { if let config { git_config_free(config) } }
+        guard git_repository_config_snapshot(&config, repo) == 0 else { return false }
+        var value: Int32 = 0
+        return git_config_get_bool(&value, config, "core.precomposeunicode") == 0 && value != 0
+    }
+
+    /// Confirms a suspicious File Provider status pair without trusting stat
+    /// metadata. This is only used for paths libgit2 called deleted while
+    /// Foundation just enumerated the same spelling on disk.
+    static func workdirFileMatchesIndexBlob(
+        repo: OpaquePointer?,
+        index: OpaquePointer?,
+        repositoryURL: URL,
+        indexPath: String,
+        diskPath: String
+    ) -> Bool {
+        guard let index,
+              let entry = indexPath.withCString({ git_index_get_bypath(index, $0, 0) }) else {
+            return false
+        }
+        var oid = entry.pointee.id
+        var blob: OpaquePointer?
+        defer { if let blob { git_blob_free(blob) } }
+        guard git_blob_lookup(&blob, repo, &oid) == 0, let blob else { return false }
+        let rawSize = git_blob_rawsize(blob)
+        // Ordinary files above the automatic LFS threshold should never need
+        // a large in-memory comparison here. Refuse rather than risk memory
+        // pressure if a malformed repository does present one.
+        guard rawSize >= 0, rawSize <= 16 * 1024 * 1024 else { return false }
+        let size = Int(rawSize)
+        guard let disk = try? Data(
+            contentsOf: repositoryURL.appendingPathComponent(diskPath),
+            options: .mappedIfSafe
+        ), disk.count == size else {
+            return false
+        }
+        if size == 0 { return true }
+        guard let raw = git_blob_rawcontent(blob) else { return false }
+        return disk == Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw), count: size, deallocator: .none)
+    }
+
+    /// The exact spelling stored on disk, found by matching each component
+    /// canonically. This deliberately ignores `core.precomposeunicode` because
+    /// callers use it to prove that the file really exists before deciding
+    /// which spelling libgit2 should stage.
+    static func workdirStoredForm(of normalizedPath: String, in repositoryURL: URL) -> String? {
+        let fileManager = FileManager.default
+        var current = repositoryURL
+        var stored: [String] = []
+        for component in normalizedPath.split(separator: "/", omittingEmptySubsequences: true).map(String.init) {
+            guard let names = try? fileManager.contentsOfDirectory(atPath: current.path) else {
+                return nil
+            }
+            let wanted = component.precomposedStringWithCanonicalMapping
+            // Prefer a canonically exact name. Case folding is only a fallback
+            // and only when it identifies one unambiguous entry.
+            let exact = names.first { $0.precomposedStringWithCanonicalMapping == wanted }
+            let folded = names.filter {
+                $0.precomposedStringWithCanonicalMapping.caseInsensitiveCompare(wanted) == .orderedSame
+            }
+            guard let match = exact ?? (folded.count == 1 ? folded[0] : nil) else { return nil }
+            stored.append(match)
+            current = current.appendingPathComponent(match)
+        }
+        return stored.joined(separator: "/")
+    }
+
+    /// Coarse, name-free description of a path's Unicode form for the log.
+    fileprivate static func unicodeForm(_ path: String) -> String {
+        if sameBytes(path, path.precomposedStringWithCanonicalMapping) { return "NFC" }
+        if sameBytes(path, path.decomposedStringWithCanonicalMapping) { return "NFD" }
+        return "mixed"
+    }
+
+    /// Removes an index entry by path, falling back to canonically equal raw
+    /// paths when the exact bytes are not found. Returns true if anything was removed.
+    /// Removes every index entry for a path, including duplicates and any
+    /// canonically-equal spelling. A single `git_index_remove_bypath` removes
+    /// one entry; an index that somehow holds the same path twice would keep
+    /// producing a phantom "deleted" delta forever.
+    @discardableResult
+    fileprivate static func removeIndexEntry(path: String, index: OpaquePointer?) throws -> Bool {
+        var removed = false
+        var candidates = [path]
+        candidates.append(contentsOf: rawIndexPaths(matching: path, index: index).filter { !sameBytes($0, path) })
+        for candidate in candidates {
+            // Loop: one call removes one entry, so drain any duplicates.
+            for _ in 0..<8 {
+                let code = candidate.withCString { git_index_remove_bypath(index, $0) }
+                if code == GIT_ENOTFOUND.rawValue { break }
+                if code != 0 {
+                    try git2Check(code, context: "Stage deletion")
+                    break
+                }
+                removed = true
+            }
+        }
+        return removed
+    }
+}
+
+// MARK: - iCloud eviction callbacks for libgit2 whole-tree passes
+
+private final class EvictionCallbackContext {
+    let workdirURL: URL
+    init(workdirURL: URL) { self.workdirURL = workdirURL }
+}
+
+/// Return 1 to skip the path, 0 to include it. Skips iCloud placeholders
+/// (never new files) and evicted originals (never deletions).
+nonisolated private func skipICloudEvictionCallback(
+    path: UnsafePointer<CChar>?,
+    matchedPathspec: UnsafePointer<CChar>?,
+    payload: UnsafeMutableRawPointer?
+) -> Int32 {
+    guard let path, let payload else { return 0 }
+    let relativePath = String(cString: path)
+    if ICloudEviction.isPlaceholder(path: relativePath) { return 1 }
+    let context = Unmanaged<EvictionCallbackContext>.fromOpaque(payload).takeUnretainedValue()
+    return ICloudEviction.isEvicted(path: relativePath, in: context.workdirURL) ? 1 : 0
 }

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct DebugLogView: View {
     @State private var entries: [LogEntry] = DebugLogger.shared.entries
+    @State private var didCopy = false
     @State private var filterLevel: LogLevel? = nil
     @State private var showShareSheet = false
     @State private var showClearConfirm = false
@@ -45,6 +46,17 @@ struct DebugLogView: View {
                     .font(.system(size: 13, weight: .black, design: .monospaced))
                     .foregroundStyle(Color.brutalText)
                     .tracking(3)
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    UIPasteboard.general.string = DebugLogger.shared.exportText(filter: filterLevel)
+                    didCopy = true
+                } label: {
+                    Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                        .foregroundStyle(Color.brutalText)
+                }
+                .disabled(entries.isEmpty)
             }
             ToolbarItem(placement: .primaryAction) {
                 Menu {

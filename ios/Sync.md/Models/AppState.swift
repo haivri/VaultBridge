@@ -127,6 +127,32 @@ private struct VaultBridgeSafeMergeExecution: Sendable {
     let shelvedEdits: Bool
     let shelfRestored: Bool
     let shelfConflicted: Bool
+    let shelfMessage: String?
+}
+
+private struct MergePullExecution: Sendable {
+    let plan: PullPlan
+    let fastForward: LocalPullResult?
+    let merge: MergeResult?
+}
+
+private enum PushExecution: Sendable {
+    case pushed(LocalRepoInfo?)
+    case serverMoved(PullPlan)
+}
+
+private struct ProtectedRestoreExecution: Sendable {
+    let restoredSHA: String
+    let snapshotOfPreviousState: GitRecoverySnapshot
+    let previousStashReapplied: Bool
+}
+
+/// Thrown when an operation failed after the user's live edits had already
+/// been moved into a stash. The caller records the shelter so the edits stay
+/// visible and are put back automatically on the next sync.
+private struct VaultBridgeStrandedShelfError: Error, Sendable {
+    let underlying: any Error
+    let stashMessage: String
 }
 
 // MARK: - App State
@@ -152,6 +178,9 @@ final class AppState {
     var stashesByRepo: [UUID: [GitStashEntry]] = [:]
     var tagsByRepo: [UUID: [GitTag]] = [:]
     var recoveryByRepo: [UUID: GitRecoverySnapshot] = [:]
+    /// Edits moved into a stash by a combine or replacement that have not been
+    /// put back yet. Shown on the vault screen and re-applied by the next sync.
+    var shelteredEditsByRepo: [UUID: VaultBridgeShelteredEdits] = [:]
 
     // MARK: - Sync State
 
@@ -410,6 +439,10 @@ final class AppState {
            let recoveries = try? JSONDecoder().decode([UUID: GitRecoverySnapshot].self, from: recoveryData) {
             recoveryByRepo = recoveries
         }
+        if let shelteredData = defaults.data(forKey: Self.shelteredEditsDefaultsKey),
+           let sheltered = try? JSONDecoder().decode([UUID: VaultBridgeShelteredEdits].self, from: shelteredData) {
+            shelteredEditsByRepo = sheltered
+        }
 
         if let accountData = defaults.data(forKey: "gitHubAccounts"),
            let decodedAccounts = try? JSONDecoder().decode([GitHubAccount].self, from: accountData) {
@@ -492,6 +525,23 @@ final class AppState {
     private func saveProtectedRecoveries() {
         guard let data = try? JSONEncoder().encode(recoveryByRepo) else { return }
         UserDefaults.standard.set(data, forKey: "vaultbridge.protected-recoveries.v1")
+    }
+
+    static let shelteredEditsDefaultsKey = "vaultbridge.sheltered-edits.v1"
+
+    private func saveShelteredEdits() {
+        guard let data = try? JSONEncoder().encode(shelteredEditsByRepo) else { return }
+        UserDefaults.standard.set(data, forKey: Self.shelteredEditsDefaultsKey)
+    }
+
+    private func recordShelteredEdits(repoID: UUID, stashMessage: String, reason: String) {
+        shelteredEditsByRepo[repoID] = VaultBridgeShelteredEdits(stashMessage: stashMessage, reason: reason)
+        saveShelteredEdits()
+    }
+
+    private func clearShelteredEdits(repoID: UUID) {
+        guard shelteredEditsByRepo.removeValue(forKey: repoID) != nil else { return }
+        saveShelteredEdits()
     }
 
     private func migrateLegacyGitHubAccountIfNeeded() {
@@ -1865,9 +1915,12 @@ final class AppState {
         }
     }
 
+    /// "Combine Phone and Server" from the drawer. The server is contacted
+    /// first so a network failure cannot strand edits in a shelf; then the
+    /// phone is saved, remaining live edits are sheltered, histories are
+    /// merged, and the shelter is put back. Nothing is uploaded.
     func mergeWithRemote(repoID: UUID) async {
         guard let repo = repo(id: repoID), repo.isCloned, !isDemoMode else { return }
-        let branch = repo.gitState.branch.isEmpty ? "main" : repo.gitState.branch
         let credentials = authPayload(for: repo)
         let authorName = repo.authorName.trimmingCharacters(in: .whitespacesAndNewlines)
         let authorEmail = repo.authorEmail.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1877,7 +1930,7 @@ final class AppState {
         }
         isSyncing = true
         syncingRepoID = repoID
-        syncProgress = String(localized: "Saving phone changes before combining…")
+        syncProgress = String(localized: "Checking the server before combining…")
         defer { isSyncing = false; syncingRepoID = nil }
 
         do {
@@ -1887,6 +1940,13 @@ final class AppState {
                 let session = try await repository.conflictSession()
                 guard !session.isActive else {
                     throw LocalGitError.conflictSessionInProgress(session.kind)
+                }
+
+                // Network first. Until this succeeds nothing on the phone has
+                // moved, so an offline device simply sees an error.
+                let plan = try await repository.pullPlan(pat: credentials)
+                if plan.action == .remoteBranchMissing {
+                    throw LocalGitError.pullRemoteBranchMissing(plan.branch)
                 }
 
                 var committedSHA: String?
@@ -1929,40 +1989,46 @@ final class AppState {
                     }
                 }
 
-                let plan = try await repository.pullPlan(pat: credentials)
-                let mergeResult: MergeResult?
-                let mergeConflicted: Bool
                 do {
-                    mergeResult = try await repository.mergeBranch(
-                        name: "origin/\(branch)",
-                        authorName: authorName,
-                        authorEmail: authorEmail
-                    )
-                    mergeConflicted = false
-                } catch LocalGitError.mergeConflictsDetected {
-                    mergeResult = nil
-                    mergeConflicted = true
-                }
+                    let mergeResult: MergeResult?
+                    let mergeConflicted: Bool
+                    do {
+                        mergeResult = try await repository.mergeBranch(
+                            name: "origin/\(plan.branch)",
+                            authorName: authorName,
+                            authorEmail: authorEmail
+                        )
+                        mergeConflicted = false
+                    } catch LocalGitError.mergeConflictsDetected {
+                        mergeResult = nil
+                        mergeConflicted = true
+                    }
 
-                var shelfRestored = false
-                var shelfConflicted = false
-                if !mergeConflicted, let shelf {
-                    let applied = try await repository.applyStash(index: shelf.index, reinstateIndex: true)
-                    shelfRestored = applied.kind == .applied
-                    shelfConflicted = applied.kind == .conflicts
-                    // Keep the shelf as a recovery copy. The user can remove
-                    // it later from Recovery after the restored files have
-                    // been reviewed and checkpointed.
+                    var shelfRestored = false
+                    var shelfConflicted = false
+                    if !mergeConflicted, let shelf {
+                        let applied = try await repository.applyStash(index: shelf.index, reinstateIndex: true)
+                        shelfRestored = applied.kind == .applied
+                        shelfConflicted = applied.kind == .conflicts
+                        // The shelf stays as a recovery copy. The user can
+                        // remove it from the expert Stash list later.
+                    }
+                    return VaultBridgeSafeMergeExecution(
+                        committedSHA: committedSHA,
+                        remoteCommitSHA: plan.remoteCommitSHA,
+                        mergeResult: mergeResult,
+                        mergeConflicted: mergeConflicted,
+                        shelvedEdits: shelf != nil,
+                        shelfRestored: shelfRestored,
+                        shelfConflicted: shelfConflicted,
+                        shelfMessage: shelf?.message
+                    )
+                } catch {
+                    if let shelf {
+                        throw VaultBridgeStrandedShelfError(underlying: error, stashMessage: shelf.message)
+                    }
+                    throw error
                 }
-                return VaultBridgeSafeMergeExecution(
-                    committedSHA: committedSHA,
-                    remoteCommitSHA: plan.remoteCommitSHA,
-                    mergeResult: mergeResult,
-                    mergeConflicted: mergeConflicted,
-                    shelvedEdits: shelf != nil,
-                    shelfRestored: shelfRestored,
-                    shelfConflicted: shelfConflicted
-                )
             }
 
             markRepositoryMutated(repoID: repoID)
@@ -1984,54 +2050,206 @@ final class AppState {
                 clearCommitHistoryCache(for: repoID)
             }
 
+            if execution.shelvedEdits, !execution.shelfRestored, !execution.shelfConflicted, let shelfMessage = execution.shelfMessage {
+                recordShelteredEdits(
+                    repoID: repoID,
+                    stashMessage: shelfMessage,
+                    reason: "Kept safe while combining with the server"
+                )
+            }
+
             if execution.mergeConflicted {
-                setPullOutcome(repoID: repoID, kind: .diverged, message: execution.shelvedEdits
-                    ? "Server merge needs choices. Your later phone edits remain safely shelved; resolve the merge first."
-                    : "Server merge needs choices. Open the conflicted files and choose what to keep.")
+                await loadConflictSession(repoID: repoID)
+                let count = conflictSessionByRepo[repoID]?.unmergedPaths.count ?? 0
+                setPullOutcome(repoID: repoID, kind: .mergeConflicts, message: Self.conflictChoiceMessage(count: count)
+                    + (execution.shelvedEdits ? " Your latest edits are sheltered and come back automatically once you finish." : ""))
             } else if execution.shelfConflicted {
-                setPullOutcome(repoID: repoID, kind: .diverged, message: "Server changes were combined, but restoring later phone edits needs your choices. The recovery shelf was kept.")
+                await loadConflictSession(repoID: repoID)
+                setPullOutcome(repoID: repoID, kind: .mergeConflicts, message: "Server changes were combined. Putting your latest edits back needs your choice for some notes.")
             } else if let result = execution.mergeResult {
                 let saved = execution.committedSHA.map { " Phone edits were saved as \(String($0.prefix(7)))." } ?? ""
-                let restored = execution.shelfRestored ? " Later phone edits were restored and their recovery shelf was kept." : ""
-                setPullOutcome(
-                    repoID: repoID,
-                    kind: result.kind == .upToDate ? .upToDate : .fastForwarded,
-                    message: (result.kind == .upToDate
-                        ? "Phone already has the latest server commit."
-                        : "Server changes were combined on this iPhone. Nothing was uploaded.") + saved + restored
-                )
+                let restored = execution.shelfRestored ? " Your latest edits were put back." : ""
+                let kind: PullOutcomeKind
+                let message: String
+                switch result.kind {
+                case .upToDate:
+                    kind = .upToDate
+                    message = "This phone already has everything on the server."
+                case .fastForwarded:
+                    kind = .fastForwarded
+                    message = "Newer server notes were brought onto this phone. Nothing was uploaded."
+                case .mergeCommitted:
+                    kind = .merged
+                    message = "Phone and server changes were combined on this phone. Nothing was uploaded."
+                }
+                setPullOutcome(repoID: repoID, kind: kind, message: message + saved + restored)
             }
             detectChanges(repoID: repoID)
             await loadBranches(repoID: repoID)
             await loadConflictSession(repoID: repoID)
         } catch is CancellationError {
-            syncProgress = "Combine cancelled"
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: "Combine cancelled")
         } catch LocalGitError.mergeBlockedByLocalChanges {
-            let message = "Some phone files are still being written, so VaultBridge did not risk overwriting them. Close the vault editor briefly, then tap Save on This iPhone and try again."
+            // The fetch completed before the safe-combine path discovered a
+            // working-tree problem. Keep that successful network check
+            // visible instead of incorrectly reverting the card to “server
+            // not checked yet.”
+            markVaultBridgeRemoteCheckSucceeded(repoID: repoID)
+            let message = "Some notes were still being written, so VaultBridge did not risk overwriting them. Wait a moment and try again."
             setPullOutcome(repoID: repoID, kind: .blockedByLocalChanges, message: message)
             showError(message: message)
-        } catch LocalGitError.mergeConflictsDetected {
+        } catch let stranded as VaultBridgeStrandedShelfError {
             markRepositoryMutated(repoID: repoID)
-            await loadConflictSession(repoID: repoID)
-            detectChanges(repoID: repoID)
-            setPullOutcome(
+            recordShelteredEdits(
                 repoID: repoID,
-                kind: .diverged,
-                message: String(localized: "Merge has conflicts — tap a conflicted file to resolve")
+                stashMessage: stranded.stashMessage,
+                reason: "Kept safe while combining with the server"
             )
+            detectChanges(repoID: repoID)
+            await loadConflictSession(repoID: repoID)
+            let message = stranded.underlying.localizedDescription
+                + " Your latest edits are sheltered and will be put back by the next sync."
+            setPullOutcome(repoID: repoID, kind: .failed, message: message)
+            showError(message: message)
         } catch {
+            setPullOutcome(repoID: repoID, kind: .failed, message: error.localizedDescription)
             showError(message: error.localizedDescription)
         }
     }
 
-    /// Destructive server replacement is only exposed through this guarded
-    /// operation. It preserves both HEAD and dirty/untracked content before
-    /// changing the working tree and never modifies the remote.
+    nonisolated static func conflictChoiceMessage(count: Int) -> String {
+        switch count {
+        case 0: "Combining needs your choice between the phone and server copies."
+        case 1: "1 note needs your choice between the phone and server copies."
+        default: "\(count) notes need your choice between the phone and server copies."
+        }
+    }
+
+    /// Expert "Force Save": rebuilds the index from the last commit and the
+    /// files on disk, then commits. Clears stale entries the per-file path
+    /// cannot address. Never touches files on disk and never uploads.
+    @discardableResult
+    func forceSaveOnPhone(repoID: UUID, message: String = "") async -> Bool {
+        guard let repo = repo(id: repoID), repo.isCloned, !isDemoMode else { return false }
+        let authorName = repo.authorName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let authorEmail = repo.authorEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !authorName.isEmpty, !authorEmail.isEmpty else {
+            showError(message: "Set a Git author name and email for \(repo.displayName) before saving.")
+            return false
+        }
+        let commitMessage = message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "VaultBridge forced save \(ISO8601DateFormatter().string(from: Date()))"
+            : message
+        isSyncing = true
+        syncingRepoID = repoID
+        syncProgress = String(localized: "Rebuilding the save from the files on disk…")
+        defer { isSyncing = false; syncingRepoID = nil }
+
+        do {
+            let serialized = try serializedRepository(repoID: repoID)
+            let sha: String? = try await serialized.withLease { repository in
+                guard repository.hasGitDirectory else { throw LocalGitError.notCloned }
+                let session = try await repository.conflictSession()
+                guard !session.isActive else {
+                    throw LocalGitError.conflictSessionInProgress(session.kind)
+                }
+                try await repository.rebuildIndexFromWorkingTree(lfsAutoTrack: true)
+                do {
+                    return try await repository.commitLocal(
+                        message: commitMessage,
+                        authorName: authorName,
+                        authorEmail: authorEmail
+                    )
+                } catch LocalGitError.noChanges {
+                    return nil
+                }
+            }
+            markRepositoryMutated(repoID: repoID)
+            if let sha, let index = repoIndex(id: repoID) {
+                repos[index].gitState.commitSHA = sha
+                repos[index].gitState.localCheckpointDate = Date()
+                saveRepos()
+                clearCommitHistoryCache(for: repoID)
+            }
+            detectChanges(repoID: repoID)
+            if let sha {
+                syncProgress = "Force-saved on this iPhone as \(String(sha.prefix(7))). Not uploaded."
+                setPullOutcome(repoID: repoID, kind: .saved, message: syncProgress)
+            } else {
+                syncProgress = "Git already holds exactly what is on disk. Stale entries were cleared; nothing new to save."
+                setPullOutcome(repoID: repoID, kind: .saved, message: syncProgress)
+            }
+            return true
+        } catch is CancellationError {
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: "Force save cancelled")
+            return false
+        } catch {
+            showError(message: error.localizedDescription, category: "commit")
+            return false
+        }
+    }
+
+    /// Puts edits that were sheltered by a combine or replacement back into
+    /// the working tree. Safe to call when nothing is sheltered.
+    @discardableResult
+    func restoreShelteredEdits(repoID: UUID, presentsErrors: Bool = true) async -> Bool {
+        guard let repo = repo(id: repoID), repo.isCloned, !isDemoMode,
+              let sheltered = shelteredEditsByRepo[repoID] else { return false }
+        isSyncing = true
+        syncingRepoID = repoID
+        syncProgress = String(localized: "Putting sheltered edits back…")
+        defer { isSyncing = false; syncingRepoID = nil }
+
+        do {
+            let serialized = try serializedRepository(repoID: repoID)
+            let result: StashApplyResult? = try await serialized.withLease { repository in
+                guard repository.hasGitDirectory else { throw LocalGitError.notCloned }
+                let session = try await repository.conflictSession()
+                guard !session.isActive else {
+                    throw LocalGitError.conflictSessionInProgress(session.kind)
+                }
+                let stashes = try await repository.listStashes()
+                guard let stash = stashes.first(where: { $0.message == sheltered.stashMessage }) else {
+                    return nil
+                }
+                return try await repository.applyStash(index: stash.index, reinstateIndex: true)
+            }
+
+            markRepositoryMutated(repoID: repoID)
+            clearShelteredEdits(repoID: repoID)
+            switch result?.kind {
+            case nil:
+                setPullOutcome(repoID: repoID, kind: .restored, message: "The shelter was already emptied. Nothing to put back.")
+            case .applied?:
+                setPullOutcome(repoID: repoID, kind: .restored, message: "Sheltered edits are back in the vault. A copy stays in the expert Stash list until you remove it.")
+            case .conflicts?:
+                await loadConflictSession(repoID: repoID)
+                let count = conflictSessionByRepo[repoID]?.unmergedPaths.count ?? 0
+                setPullOutcome(repoID: repoID, kind: .mergeConflicts, message: "Putting sheltered edits back needs your choice. " + Self.conflictChoiceMessage(count: count))
+            }
+            detectChanges(repoID: repoID)
+            return result?.kind != .conflicts
+        } catch is CancellationError {
+            return false
+        } catch {
+            if presentsErrors {
+                showError(message: error.localizedDescription, category: "recovery")
+            } else {
+                DebugLogger.shared.error("recovery", error.localizedDescription)
+            }
+            return false
+        }
+    }
+
+    /// Emergency replacement is only exposed through this guarded operation.
+    /// The server is contacted first, then the current commit and every dirty
+    /// or untracked file are preserved, and only then is the checked-out
+    /// branch moved to the server copy. The remote is never modified.
     func replacePhoneCopyWithServer(repoID: UUID) async {
         guard let repo = repo(id: repoID), repo.isCloned, !isDemoMode else { return }
         isSyncing = true
         syncingRepoID = repoID
-        syncProgress = String(localized: "Creating protected recovery snapshot…")
+        syncProgress = String(localized: "Checking the server, then protecting phone files…")
         defer { isSyncing = false; syncingRepoID = nil }
 
         do {
@@ -2040,8 +2258,21 @@ final class AppState {
             let serialized = try serializedRepository(repoID: repoID)
             let result = try await serialized.withLease { repository in
                 guard repository.hasGitDirectory else { throw LocalGitError.notCloned }
+                let session = try await repository.conflictSession()
+                guard !session.isActive else {
+                    throw LocalGitError.conflictSessionInProgress(session.kind)
+                }
+
+                // Reach the server before touching anything. The plan also
+                // names the branch that is actually checked out, so the
+                // replacement can never move a different branch.
+                let plan = try await repository.pullPlan(pat: credentials)
+                if plan.action == .remoteBranchMissing {
+                    throw LocalGitError.pullRemoteBranchMissing(plan.branch)
+                }
+
                 let info = try await repository.repoInfo()
-                let stash: GitStashEntry?
+                var stash: GitStashEntry?
                 if info.changeCount > 0 {
                     stash = try await repository.saveStash(
                         message: stashMessage,
@@ -2049,18 +2280,22 @@ final class AppState {
                         authorEmail: repo.authorEmail,
                         includeUntracked: true
                     )
-                } else {
-                    stash = nil
                 }
-                let headRecovery = try await repository.createRecoveryReference()
-                try await repository.fetchRemote(pat: credentials)
-                let newSHA = try await repository.hardReset(referenceName: "refs/remotes/origin/\(repo.branch)")
-                let recovery = GitRecoverySnapshot(
-                    referenceName: headRecovery.referenceName,
-                    commitSHA: headRecovery.commitSHA,
-                    stashMessage: stash?.message
-                )
-                return (recovery, newSHA)
+                do {
+                    let headRecovery = try await repository.createRecoveryReference()
+                    let newSHA = try await repository.hardReset(referenceName: "refs/remotes/origin/\(plan.branch)")
+                    let recovery = GitRecoverySnapshot(
+                        referenceName: headRecovery.referenceName,
+                        commitSHA: headRecovery.commitSHA,
+                        stashMessage: stash?.message
+                    )
+                    return (recovery, newSHA)
+                } catch {
+                    if let stash {
+                        throw VaultBridgeStrandedShelfError(underlying: error, stashMessage: stash.message)
+                    }
+                    throw error
+                }
             }
 
             recoveryByRepo[repoID] = result.0
@@ -2068,43 +2303,119 @@ final class AppState {
             markRepositoryMutated(repoID: repoID)
             if let index = repoIndex(id: repoID) {
                 repos[index].gitState.commitSHA = result.1
+                repos[index].gitState.remoteCommitSHA = result.1
+                repos[index].gitState.lastRemoteCheckDate = Date()
                 repos[index].gitState.lastSyncDate = Date()
                 saveRepos()
             }
             clearCommitHistoryCache(for: repoID)
             detectChanges(repoID: repoID)
-            setPullOutcome(repoID: repoID, kind: .fastForwarded, message: String(localized: "Phone copy replaced from server. Recovery is available in Git Tools."))
+            setPullOutcome(repoID: repoID, kind: .restored, message: String(localized: "This phone now matches the server. The previous phone state is protected and can be restored from Git Tools."))
+        } catch let stranded as VaultBridgeStrandedShelfError {
+            markRepositoryMutated(repoID: repoID)
+            recordShelteredEdits(
+                repoID: repoID,
+                stashMessage: stranded.stashMessage,
+                reason: "Kept safe during an emergency replacement"
+            )
+            detectChanges(repoID: repoID)
+            let message = stranded.underlying.localizedDescription
+                + " Your unsaved edits are sheltered and will be put back by the next sync."
+            setPullOutcome(repoID: repoID, kind: .failed, message: message)
+            showError(message: message, category: "recovery")
+        } catch is CancellationError {
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: "Replacement cancelled before any phone file changed.")
         } catch {
             showError(message: error.localizedDescription, category: "recovery")
         }
     }
 
+    /// Returns to the protected phone backup. The state being left behind is
+    /// itself protected first (commit reference plus a stash of live edits),
+    /// so Restore is always reversible and never discards vault contents.
     func restoreProtectedRecovery(repoID: UUID) async {
         guard let repo = repo(id: repoID), let recovery = recoveryByRepo[repoID], !isDemoMode else { return }
         isSyncing = true
         syncingRepoID = repoID
-        syncProgress = String(localized: "Restoring protected recovery…")
+        syncProgress = String(localized: "Protecting current files, then restoring the backup…")
         defer { isSyncing = false; syncingRepoID = nil }
 
         do {
             let serialized = try serializedRepository(repoID: repoID)
-            let sha = try await serialized.withLease { repository in
-                let sha = try await repository.hardReset(referenceName: recovery.referenceName)
-                if let stashMessage = recovery.stashMessage {
-                    let stashes = try await repository.listStashes()
-                    if let stash = stashes.first(where: { $0.message == stashMessage }) {
-                        _ = try await repository.applyStash(index: stash.index, reinstateIndex: true)
-                    }
+            let outcome = try await serialized.withLease { repository in
+                guard repository.hasGitDirectory else { throw LocalGitError.notCloned }
+                let session = try await repository.conflictSession()
+                guard !session.isActive else {
+                    throw LocalGitError.conflictSessionInProgress(session.kind)
                 }
-                return sha
+
+                let info = try await repository.repoInfo()
+                var currentStash: GitStashEntry?
+                if info.changeCount > 0 {
+                    currentStash = try await repository.saveStash(
+                        message: "VaultBridge protected recovery before restore \(UUID().uuidString)",
+                        authorName: repo.authorName,
+                        authorEmail: repo.authorEmail,
+                        includeUntracked: true
+                    )
+                }
+                do {
+                    let currentSnapshot = try await repository.createRecoveryReference()
+                    let sha = try await repository.hardReset(referenceName: recovery.referenceName)
+                    var reapplied = true
+                    if let stashMessage = recovery.stashMessage {
+                        let stashes = try await repository.listStashes()
+                        if let stash = stashes.first(where: { $0.message == stashMessage }) {
+                            reapplied = try await repository.applyStash(index: stash.index, reinstateIndex: true).kind == .applied
+                        }
+                    }
+                    return ProtectedRestoreExecution(
+                        restoredSHA: sha,
+                        snapshotOfPreviousState: GitRecoverySnapshot(
+                            referenceName: currentSnapshot.referenceName,
+                            commitSHA: currentSnapshot.commitSHA,
+                            stashMessage: currentStash?.message
+                        ),
+                        previousStashReapplied: reapplied
+                    )
+                } catch {
+                    if let currentStash {
+                        throw VaultBridgeStrandedShelfError(underlying: error, stashMessage: currentStash.message)
+                    }
+                    throw error
+                }
             }
+
+            // The state just left becomes the new protected backup.
+            recoveryByRepo[repoID] = outcome.snapshotOfPreviousState
+            saveProtectedRecoveries()
             markRepositoryMutated(repoID: repoID)
             if let index = repoIndex(id: repoID) {
-                repos[index].gitState.commitSHA = sha
+                repos[index].gitState.commitSHA = outcome.restoredSHA
                 saveRepos()
             }
+            clearCommitHistoryCache(for: repoID)
             detectChanges(repoID: repoID)
-            setPullOutcome(repoID: repoID, kind: .diverged, message: String(localized: "Protected phone state restored. Review before synchronizing."))
+            if outcome.previousStashReapplied {
+                setPullOutcome(repoID: repoID, kind: .restored, message: String(localized: "Protected phone backup restored. The files you just left are now the protected backup, so this can be undone."))
+            } else {
+                await loadConflictSession(repoID: repoID)
+                setPullOutcome(repoID: repoID, kind: .mergeConflicts, message: String(localized: "Protected phone backup restored, but putting its sheltered edits back needs your choice for some notes."))
+            }
+        } catch let stranded as VaultBridgeStrandedShelfError {
+            markRepositoryMutated(repoID: repoID)
+            recordShelteredEdits(
+                repoID: repoID,
+                stashMessage: stranded.stashMessage,
+                reason: "Kept safe during a backup restore"
+            )
+            detectChanges(repoID: repoID)
+            let message = stranded.underlying.localizedDescription
+                + " Your unsaved edits are sheltered and will be put back by the next sync."
+            setPullOutcome(repoID: repoID, kind: .failed, message: message)
+            showError(message: message, category: "recovery")
+        } catch is CancellationError {
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: "Restore cancelled before any phone file changed.")
         } catch {
             showError(message: error.localizedDescription, category: "recovery")
         }
@@ -2157,10 +2468,10 @@ final class AppState {
         }
     }
 
-    func completeMerge(repoID: UUID, message: String = "") async {
+    func completeMerge(repoID: UUID, message: String = "", presentsErrors: Bool = true) async {
         guard let repo = repo(id: repoID), repo.isCloned, !isDemoMode else { return }
         let commitMessage = message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? String(localized: "Merge branch")
+            ? String(localized: "Combine phone and server changes")
             : message
         isSyncing = true
         syncingRepoID = repoID
@@ -2187,14 +2498,22 @@ final class AppState {
             }
             setPullOutcome(
                 repoID: repoID,
-                kind: .fastForwarded,
-                message: String(localized: "Merge completed locally. Upload when ready.")
+                kind: .merged,
+                message: String(localized: "Phone and server changes are combined on this phone. Sync Now uploads them.")
             )
             detectChanges(repoID: repoID)
             await loadConflictSession(repoID: repoID)
         } catch {
             await loadConflictSession(repoID: repoID)
-            showError(message: error.localizedDescription)
+            if presentsErrors {
+                showError(message: error.localizedDescription)
+            } else {
+                DebugLogger.shared.error("merge", error.localizedDescription)
+            }
+            return
+        }
+        if shelteredEditsByRepo[repoID] != nil {
+            await restoreShelteredEdits(repoID: repoID, presentsErrors: presentsErrors)
         }
     }
 
@@ -2214,11 +2533,15 @@ final class AppState {
         syncingRepoID = repoID
         syncProgress = String(localized: "Aborting merge...")
 
+        var aborted = false
         do {
             try await gitService.abortMerge()
+            aborted = true
+            markRepositoryMutated(repoID: repoID)
             clearCommitHistoryCache(for: repoID)
             detectChanges(repoID: repoID)
             await loadConflictSession(repoID: repoID)
+            setPullOutcome(repoID: repoID, kind: .diverged, message: String(localized: "Combine abandoned. Phone and server still differ; Sync Now will try again."))
         } catch {
             await loadConflictSession(repoID: repoID)
             showError(message: error.localizedDescription)
@@ -2226,6 +2549,9 @@ final class AppState {
 
         isSyncing = false
         syncingRepoID = nil
+        if aborted, shelteredEditsByRepo[repoID] != nil {
+            await restoreShelteredEdits(repoID: repoID)
+        }
     }
 
     func markRepositoryMutated(repoID: UUID) {
@@ -2690,8 +3016,8 @@ final class AppState {
             setPullOutcome(repoID: repoID, kind: .blockedByLocalChanges, message: String(localized: "This phone has edits that are not saved in a restore point yet. Tap Save on This iPhone, then bring in server updates."))
 
         case .diverged:
-            syncProgress = String(localized: "Pull requires merge")
-            setPullOutcome(repoID: repoID, kind: .diverged, message: String(localized: "Local and remote have diverged. Merge support is required to continue."))
+            syncProgress = String(localized: "Both sides have new work")
+            setPullOutcome(repoID: repoID, kind: .diverged, message: String(localized: "This phone and the server both have saved work. Sync Now combines them."))
 
         case .remoteBranchMissing(let branch):
             syncProgress = String(localized: "Remote branch missing")
@@ -2722,6 +3048,7 @@ final class AppState {
             // That is expected control flow, not an error worth alarming the
             // user about.
             syncProgress = String(localized: "Refresh cancelled")
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: String(localized: "Check cancelled"))
         }
 
         // The mutation generation was advanced before the runner began. Always
@@ -2833,7 +3160,7 @@ final class AppState {
         } catch is CancellationError {
             // A cancelled automatic run (e.g. abandoned pull-to-refresh) is not
             // a Git failure; never surface it as a modal error.
-            setPullOutcome(repoID: repoID, kind: .failed, message: String(localized: "Sync was cancelled"))
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: String(localized: "Sync was cancelled"))
         } catch {
             setPullOutcome(repoID: repoID, kind: .failed, message: error.localizedDescription)
             if presentsErrors {
@@ -2844,6 +3171,158 @@ final class AppState {
         }
         if showsProgressDelay { try? await Task.sleep(for: .seconds(1)) }
         return false
+    }
+
+    /// The reconcile step of the automatic workflow. Fetches, then brings the
+    /// server's work onto this phone: a fast-forward when only the server
+    /// moved, a merge commit when both sides moved. A merge never rewrites the
+    /// phone's commits, so the commit ID the user was shown stays valid.
+    /// Returns true when the vault is ready to upload.
+    @discardableResult
+    func pullWithMerge(
+        repoID: UUID,
+        presentsErrors: Bool = true,
+        refreshStatus: Bool = true
+    ) async -> Bool {
+        guard let repo = repo(id: repoID) else {
+            showError(message: String(localized: "Repository not found"))
+            return false
+        }
+        isSyncing = true
+        syncingRepoID = repoID
+        syncProgress = String(localized: "Comparing phone and server…")
+        defer { isSyncing = false; syncingRepoID = nil }
+
+        if isDemoMode {
+            if let currentIndex = repoIndex(id: repoID) {
+                repos[currentIndex].gitState.lastSyncDate = Date()
+                saveRepos()
+            }
+            setPullOutcome(repoID: repoID, kind: .upToDate, message: String(localized: "Up to date with the server"))
+            return true
+        }
+        pullOutcomeByRepo.removeValue(forKey: repoID)
+        let credentials = authPayload(for: repo)
+        let authorName = repo.authorName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let authorEmail = repo.authorEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let serialized = try serializedRepository(repoID: repoID)
+            let execution: MergePullExecution = try await serialized.withLease { repository in
+                guard repository.hasGitDirectory else { throw LocalGitError.notCloned }
+                let plan = try await repository.pullPlan(pat: credentials)
+                switch plan.action {
+                case .fastForward:
+                    let result = try await repository.pullFastForward(branch: plan.branch, pat: credentials)
+                    return MergePullExecution(plan: plan, fastForward: result, merge: nil)
+                case .diverged:
+                    guard !authorName.isEmpty, !authorEmail.isEmpty else {
+                        throw LocalGitError.invalidAuthorIdentity("Set a Git author name and email for \(repo.displayName) before combining phone and server changes.")
+                    }
+                    let merge = try await repository.mergeBranch(
+                        name: "origin/\(plan.branch)",
+                        authorName: authorName,
+                        authorEmail: authorEmail
+                    )
+                    return MergePullExecution(plan: plan, fastForward: nil, merge: merge)
+                case .upToDate, .blockedByLocalChanges, .remoteBranchMissing:
+                    return MergePullExecution(plan: plan, fastForward: nil, merge: nil)
+                }
+            }
+
+            let plan = execution.plan
+            if let currentIndex = repoIndex(id: repoID) {
+                if !plan.remoteCommitSHA.isEmpty {
+                    repos[currentIndex].gitState.remoteCommitSHA = plan.remoteCommitSHA
+                }
+                repos[currentIndex].gitState.lastRemoteCheckDate = Date()
+                repos[currentIndex].gitState.lastSyncDate = Date()
+                saveRepos()
+            }
+
+            switch plan.action {
+            case .upToDate:
+                syncStateByRepo[repoID] = plan.aheadBy > 0 ? .ahead : .upToDate
+                setPullOutcome(
+                    repoID: repoID,
+                    kind: .upToDate,
+                    message: plan.aheadBy > 0
+                        ? String(localized: "Server checked. This phone has saved work to upload.")
+                        : String(localized: "Up to date with the server")
+                )
+                return true
+            case .blockedByLocalChanges:
+                setPullOutcome(repoID: repoID, kind: .blockedByLocalChanges, message: String(localized: "Some notes were still being written. Sync again in a moment."))
+                return false
+            case .remoteBranchMissing:
+                setPullOutcome(repoID: repoID, kind: .remoteBranchMissing, message: String(localized: "The server has no '\(plan.branch)' branch yet. Uploading will create it."))
+                return true
+            case .fastForward:
+                guard let result = execution.fastForward else { return false }
+                markRepositoryMutated(repoID: repoID)
+                if result.updated, let currentIndex = repoIndex(id: repoID) {
+                    repos[currentIndex].gitState.commitSHA = result.newCommitSHA
+                    saveRepos()
+                    clearCommitHistoryCache(for: repoID)
+                    changeCounts[repoID] = 0
+                    statusEntriesByRepo[repoID] = []
+                    syncStateByRepo[repoID] = .upToDate
+                }
+                setPullOutcome(
+                    repoID: repoID,
+                    kind: result.updated ? .fastForwarded : .upToDate,
+                    message: result.updated
+                        ? String(localized: "Newer server notes were brought onto this phone.")
+                        : String(localized: "Up to date with the server")
+                )
+                if refreshStatus {
+                    detectChanges(repoID: repoID)
+                    await loadBranches(repoID: repoID)
+                }
+                return true
+            case .diverged:
+                guard let merge = execution.merge else { return false }
+                markRepositoryMutated(repoID: repoID)
+                if let currentIndex = repoIndex(id: repoID), !merge.newCommitSHA.isEmpty {
+                    repos[currentIndex].gitState.commitSHA = merge.newCommitSHA
+                    saveRepos()
+                    clearCommitHistoryCache(for: repoID)
+                }
+                syncStateByRepo[repoID] = merge.kind == .upToDate ? .upToDate : .ahead
+                setPullOutcome(
+                    repoID: repoID,
+                    kind: merge.kind == .upToDate ? .upToDate : .merged,
+                    message: merge.kind == .upToDate
+                        ? String(localized: "Up to date with the server")
+                        : String(localized: "Phone and server changes were combined on this phone.")
+                )
+                if refreshStatus {
+                    detectChanges(repoID: repoID)
+                    await loadBranches(repoID: repoID)
+                }
+                return true
+            }
+        } catch LocalGitError.mergeConflictsDetected {
+            markRepositoryMutated(repoID: repoID)
+            await loadConflictSession(repoID: repoID)
+            if refreshStatus { detectChanges(repoID: repoID) }
+            let count = conflictSessionByRepo[repoID]?.unmergedPaths.count ?? 0
+            setPullOutcome(repoID: repoID, kind: .mergeConflicts, message: Self.conflictChoiceMessage(count: count))
+            return false
+        } catch LocalGitError.mergeBlockedByLocalChanges {
+            setPullOutcome(repoID: repoID, kind: .blockedByLocalChanges, message: String(localized: "Some notes were still being written. Sync again in a moment."))
+            return false
+        } catch is CancellationError {
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: String(localized: "Sync was cancelled"))
+            return false
+        } catch {
+            setPullOutcome(repoID: repoID, kind: .failed, message: error.localizedDescription)
+            if presentsErrors {
+                showError(message: error.localizedDescription, category: "merge")
+            } else {
+                DebugLogger.shared.error("merge", error.localizedDescription)
+            }
+            return false
+        }
     }
 
     func continueRebase(repoID: UUID) async {
@@ -2937,7 +3416,8 @@ final class AppState {
     func pushCurrentBranch(
         repoID: UUID,
         presentsErrors: Bool = true,
-        refreshStatus: Bool = true
+        refreshStatus: Bool = true,
+        preflightFetch: Bool = true
     ) async -> Bool {
         guard let repo = repo(id: repoID), repo.isCloned else { return false }
         if isDemoMode {
@@ -2953,42 +3433,76 @@ final class AppState {
         let credentials = authPayload(for: repo)
         isSyncing = true
         syncingRepoID = repoID
-        syncProgress = String(localized: "Pushing committed changes...")
+        syncProgress = String(localized: "Uploading saved changes…")
         pushErrorByRepo.removeValue(forKey: repoID)
         defer { isSyncing = false; syncingRepoID = nil }
 
         do {
             let serialized = try serializedRepository(repoID: repoID)
-            let info = try await serialized.withLease { repository in
+            let execution: PushExecution = try await serialized.withLease { repository in
                 guard repository.hasGitDirectory else { throw LocalGitError.notCloned }
+                if preflightFetch {
+                    // Uploading blind turned "not uploaded yet" into an endless
+                    // loop: the server had moved, the push was rejected with a
+                    // Git message, and nothing re-classified the vault. Look
+                    // first and let the sync workflow combine.
+                    let plan = try await repository.pullPlan(pat: credentials)
+                    switch plan.action {
+                    case .fastForward, .diverged, .blockedByLocalChanges:
+                        return .serverMoved(plan)
+                    case .upToDate, .remoteBranchMissing:
+                        break
+                    }
+                }
                 try await repository.pushCurrentBranch(pat: credentials)
-                return try? await repository.repoInfo()
+                return .pushed(try? await repository.repoInfo())
             }
 
-            if let currentIndex = repoIndex(id: repoID) {
-                if let info {
-                    repos[currentIndex].gitState.branch = info.branch
-                    repos[currentIndex].gitState.commitSHA = info.commitSHA
-                    changeCounts[repoID] = info.changeCount
-                    statusEntriesByRepo[repoID] = info.statusEntries
-                    syncStateByRepo[repoID] = info.syncState
-                    repos[currentIndex].gitState.remoteCommitSHA = info.commitSHA
+            switch execution {
+            case .serverMoved(let plan):
+                if let currentIndex = repoIndex(id: repoID) {
+                    if !plan.remoteCommitSHA.isEmpty {
+                        repos[currentIndex].gitState.remoteCommitSHA = plan.remoteCommitSHA
+                    }
                     repos[currentIndex].gitState.lastRemoteCheckDate = Date()
+                    saveRepos()
                 }
-                repos[currentIndex].gitState.lastSyncDate = Date()
-                saveRepos()
-                clearCommitHistoryCache(for: repoID)
+                syncStateByRepo[repoID] = plan.aheadBy > 0 ? .diverged : .behind
+                let message = plan.aheadBy > 0
+                    ? String(localized: "The server has newer notes and this phone has saved work. Sync Now combines them, then uploads.")
+                    : String(localized: "The server has newer notes. Sync Now brings them in first.")
+                syncProgress = message
+                setPullOutcome(repoID: repoID, kind: .diverged, message: message)
+                if refreshStatus { detectChanges(repoID: repoID) }
+                return false
+
+            case .pushed(let info):
+                if let currentIndex = repoIndex(id: repoID) {
+                    if let info {
+                        repos[currentIndex].gitState.branch = info.branch
+                        repos[currentIndex].gitState.commitSHA = info.commitSHA
+                        changeCounts[repoID] = info.changeCount
+                        statusEntriesByRepo[repoID] = info.statusEntries
+                        syncStateByRepo[repoID] = info.syncState
+                        repos[currentIndex].gitState.remoteCommitSHA = info.commitSHA
+                        repos[currentIndex].gitState.lastRemoteCheckDate = Date()
+                    }
+                    repos[currentIndex].gitState.lastSyncDate = Date()
+                    saveRepos()
+                    clearCommitHistoryCache(for: repoID)
+                }
+                if refreshStatus {
+                    detectChanges(repoID: repoID)
+                    await loadBranches(repoID: repoID)
+                }
+                let verifiedSHA = info?.commitSHA ?? repo.gitState.commitSHA
+                syncProgress = "Uploaded and verified on the server at \(String(verifiedSHA.prefix(7))). Phone and server match."
+                setPullOutcome(repoID: repoID, kind: .upToDate, message: syncProgress)
+                requestReviewIfNeeded()
+                return true
             }
-            if refreshStatus {
-                detectChanges(repoID: repoID)
-                await loadBranches(repoID: repoID)
-            }
-            let verifiedSHA = info?.commitSHA ?? repo.gitState.commitSHA
-            syncProgress = "Uploaded and verified on the server at \(String(verifiedSHA.prefix(7))). Phone and server now match."
-            setPullOutcome(repoID: repoID, kind: .upToDate, message: syncProgress)
-            requestReviewIfNeeded()
-            return true
         } catch is CancellationError {
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: String(localized: "Upload cancelled"))
             return false
         } catch {
             let isLFSRepairEligible: Bool
@@ -2997,22 +3511,41 @@ final class AppState {
             } else {
                 isLFSRepairEligible = false
             }
+            let message = Self.plainPushFailureMessage(for: error)
             pushErrorByRepo[repoID] = PushErrorState(
-                message: error.localizedDescription,
+                message: message,
                 isLFSRepairEligible: isLFSRepairEligible,
                 date: Date()
             )
+            setPullOutcome(repoID: repoID, kind: .failed, message: message)
+            if refreshStatus { detectChanges(repoID: repoID) }
             // The SSH host-key prompt stays active even for automatic runs —
             // it is an actionable decision, not an error report.
             if !handleSSHHostKeyTrustIfNeeded(error, repoID: repoID, operation: .pushCurrentBranch) {
                 if presentsErrors {
-                    showError(message: error.localizedDescription, category: "push")
+                    showError(message: message, category: "push")
                 } else {
-                    DebugLogger.shared.error("push", error.localizedDescription)
+                    DebugLogger.shared.error("push", message)
                 }
             }
             return false
         }
+    }
+
+    /// A rejected non-fast-forward push is the one Git error every vault user
+    /// eventually meets. Say what happened and what the app will do about it.
+    nonisolated static func plainPushFailureMessage(for error: Error) -> String {
+        if case LocalGitError.pushFailed(let detail) = error {
+            let lowered = detail.lowercased()
+            if lowered.contains("not present locally")
+                || lowered.contains("fast-forward")
+                || lowered.contains("fast forward")
+                || lowered.contains("fetch first")
+                || lowered.contains("non-fast") {
+                return String(localized: "The server changed while uploading. Sync Now combines the new server notes with this phone's work, then uploads.")
+            }
+        }
+        return error.localizedDescription
     }
 
     /// Explicit repair for large files that were committed as ordinary blobs
@@ -3066,6 +3599,54 @@ final class AppState {
         syncingRepoID = nil
         guard repairSucceeded else { return false }
         return await pushCurrentBranch(repoID: repoID)
+    }
+
+    /// Checks every current Git LFS attachment against the server and uploads
+    /// only missing payloads. This changes neither files nor Git history.
+    @discardableResult
+    func repairMissingLFSObjects(repoID: UUID) async -> Bool {
+        guard let repo = repo(id: repoID), repo.isCloned, !isDemoMode else { return false }
+        guard !isSyncing else { return false }
+
+        isSyncing = true
+        syncingRepoID = repoID
+        syncProgress = String(localized: "Checking attachment backups…")
+        defer {
+            isSyncing = false
+            syncingRepoID = nil
+        }
+
+        do {
+            let credentials = authPayload(for: repo)
+            let serialized = try serializedRepository(repoID: repoID)
+            let result = try await serialized.withLease { repository in
+                guard repository.hasGitDirectory else { throw LocalGitError.notCloned }
+                return try await repository.backfillLFSObjects(pat: credentials)
+            }
+
+            let message: String
+            if result.referencedCount == 0 {
+                message = String(localized: "No Git LFS attachments are referenced by this phone. No files or commits changed.")
+            } else if result.uploadedCount == 0 {
+                message = String(localized: "Verified all \(result.referencedCount) attachment backups on the server. No files or commits changed.")
+            } else {
+                message = String(localized: "Repaired and verified \(result.uploadedCount) missing attachment backups on the server. No files or commits changed.")
+            }
+            syncProgress = message
+            setPullOutcome(repoID: repoID, kind: .saved, message: message)
+            DebugLogger.shared.info(
+                "lfs",
+                "Verified current Git LFS attachment backups",
+                detail: "referenced=\(result.referencedCount), uploaded=\(result.uploadedCount)"
+            )
+            return true
+        } catch is CancellationError {
+            setPullOutcome(repoID: repoID, kind: .cancelled, message: "Attachment backup repair cancelled")
+            return false
+        } catch {
+            showError(message: error.localizedDescription, category: "lfs")
+            return false
+        }
     }
 
     @discardableResult

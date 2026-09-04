@@ -14,6 +14,10 @@ struct GitControlSheet: View {
     @State private var stashMessage = ""
     @State private var newTagName = ""
     @State private var newTagMessage = ""
+    @State private var revertPath: String? = nil
+    @State private var showRevertAllConfirm = false
+    @State private var showForceSaveConfirm = false
+    @State private var showLFSBackfillConfirm = false
 
     private var repo: RepoConfig? { state.repo(id: repoID) }
     private var changeCount: Int { state.changeCounts[repoID] ?? 0 }
@@ -42,6 +46,8 @@ struct GitControlSheet: View {
                         if !isThisRepoSyncing, !verifiedResultText.isEmpty { verifiedResultCard }
                         if hasConflictSession { conflictCenterCard }
                         localCommitCard
+                        forceSaveCard
+                        lfsBackfillCard
                         fetchCard
                         pullCard
                         pullRebaseCard
@@ -83,6 +89,14 @@ struct GitControlSheet: View {
             } message: {
                 Text(state.lastError ?? String(localized: "Unknown error"))
             }
+            .alert("Force Save From Disk?", isPresented: $showForceSaveConfirm) {
+                Button("Force Save") {
+                    Task { await state.forceSaveOnPhone(repoID: repoID, message: commitMessage) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Rebuilds Git's record of this phone from the last commit and the files actually on disk, applies the Git LFS policy, and commits. Files on disk are never changed. Use this when the normal save reports files that cannot be saved. Nothing is uploaded.")
+            }
             .alert("Use Git LFS?", isPresented: Binding(
                 get: { state.pendingLFSAutoTrackingConfirmation != nil },
                 set: { _ in
@@ -101,12 +115,52 @@ struct GitControlSheet: View {
             } message: {
                 Text(state.pendingLFSAutoTrackingConfirmation?.message ?? "")
             }
+            .alert("Repair Missing Attachment Backups?", isPresented: $showLFSBackfillConfirm) {
+                Button("Check and Repair") {
+                    Task { await state.repairMissingLFSObjects(repoID: repoID) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Checks every large attachment referenced by this phone and uploads only copies missing from the server. It does not change files, create commits, rewrite history, or upload ordinary note changes.")
+            }
             .navigationDestination(item: $diffDestination) { dest in
                 FileDiffView(repoID: dest.repoID, path: dest.path)
             }
             .navigationDestination(item: $conflictEditorDestination) { dest in
                 ConflictEditorView(repoID: dest.repoID, path: dest.path)
             }
+            .overlay {
+                if showRevertAllConfirm {
+                    RevertConfirmModal(
+                        title: String(localized: "Revert All Changes"),
+                        filename: nil,
+                        files: sortedEntries.map(\.path),
+                        confirmLabel: String(localized: "Revert All"),
+                        onConfirm: {
+                            showRevertAllConfirm = false
+                            Task { await state.discardAllFileChanges(repoID: repoID) }
+                        },
+                        onCancel: { showRevertAllConfirm = false }
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                }
+                if let path = revertPath {
+                    RevertConfirmModal(
+                        title: String(localized: "Revert Changes"),
+                        filename: URL(fileURLWithPath: path).lastPathComponent,
+                        files: [],
+                        confirmLabel: String(localized: "Revert"),
+                        onConfirm: {
+                            revertPath = nil
+                            Task { await state.discardFileChanges(repoID: repoID, path: path) }
+                        },
+                        onCancel: { revertPath = nil }
+                    )
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                }
+            }
+            .animation(.easeOut(duration: 0.18), value: showRevertAllConfirm)
+            .animation(.easeOut(duration: 0.18), value: revertPath)
             .task {
                 #if DEBUG
                 guard !MarketingCapture.isActive else { return }
@@ -191,11 +245,25 @@ struct GitControlSheet: View {
         return state.syncProgress
     }
 
+    private var verifiedResultTone: PullOutcomeKind.Tone {
+        state.pullOutcomeByRepo[repoID]?.kind.tone ?? .neutral
+    }
+
+    private var verifiedResultColor: Color {
+        switch verifiedResultTone {
+        case .success: .brutalSuccess
+        case .info: .brutalAccent
+        case .attention: .brutalWarning
+        case .failure: .brutalError
+        case .neutral: .brutalTextMid
+        }
+    }
+
     private var verifiedResultCard: some View {
-        BCard(padding: 14, bg: Color.brutalSuccess.opacity(0.06)) {
+        BCard(padding: 14, bg: verifiedResultColor.opacity(0.06)) {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "checkmark.seal.fill")
-                    .foregroundStyle(Color.brutalSuccess)
+                Image(systemName: state.pullOutcomeByRepo[repoID]?.kind.systemImage ?? "checkmark.seal.fill")
+                    .foregroundStyle(verifiedResultColor)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("ACTION RESULT")
                         .font(.system(size: 12, weight: .black, design: .monospaced))
@@ -512,17 +580,20 @@ struct GitControlSheet: View {
                     let entries = sortedEntries
                     let hasUnstagedEntries = entries.contains { $0.workTreeStatus != nil }
 
-                    if hasUnstagedEntries {
-                        HStack {
-                            Spacer()
+                    HStack(spacing: 8) {
+                        Spacer()
+                        if hasUnstagedEntries {
                             smallActionButton(String(localized: "Stage All").uppercased()) {
                                 Task { await state.stageAllChanges(repoID: repoID) }
                             }
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 8)
-                        .disabled(state.isSyncing)
+                        smallActionButton(String(localized: "Revert All").uppercased(), isDestructive: true) {
+                            showRevertAllConfirm = true
+                        }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+                    .disabled(state.isSyncing)
 
                     LazyVStack(spacing: 0) {
                         ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
@@ -565,6 +636,10 @@ struct GitControlSheet: View {
 
             smallActionButton(String(localized: "Diff").uppercased()) {
                 openDiff(for: entry.path)
+            }
+
+            smallActionButton(String(localized: "Revert").uppercased(), isDestructive: true) {
+                revertPath = entry.path
             }
         }
         .padding(.horizontal, 16)
@@ -883,6 +958,42 @@ struct GitControlSheet: View {
                 .disabled(changeCount == 0 || state.isSyncing)
             }
         }
+    }
+
+    // MARK: - Force Save Card
+
+    private var forceSaveCard: some View {
+        Button {
+            showForceSaveConfirm = true
+        } label: {
+            BCard(padding: 0) {
+                BActionRow(
+                    icon: "hammer",
+                    title: String(localized: "Force Save From Disk"),
+                    subtitle: String(localized: "Rebuild the index from the last commit and the files on disk, then commit. Clears entries the normal save cannot address. Never changes files or uploads.")
+                )
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(state.isSyncing || hasConflictSession)
+        .opacity(state.isSyncing || hasConflictSession ? 0.45 : 1)
+    }
+
+    private var lfsBackfillCard: some View {
+        Button {
+            showLFSBackfillConfirm = true
+        } label: {
+            BCard(padding: 0) {
+                BActionRow(
+                    icon: "externaldrive.badge.checkmark",
+                    title: String(localized: "Repair Missing Attachment Backups"),
+                    subtitle: String(localized: "Verifies every large-file backup and uploads only missing copies. Does not change files, commits, or ordinary notes.")
+                )
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(state.isSyncing || hasConflictSession)
+        .opacity(state.isSyncing || hasConflictSession ? 0.45 : 1)
     }
 
     // MARK: - Push Card

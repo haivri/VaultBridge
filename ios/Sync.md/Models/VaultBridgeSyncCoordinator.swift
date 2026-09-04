@@ -233,7 +233,14 @@ final class VaultBridgeSyncCoordinator {
             return
         }
 
-        await update(repo: repo, phase: .inspecting, message: "Checking for local changes")
+        func stopForAttention(_ message: String) async {
+            await update(repo: repo, phase: .attention, message: message)
+            if automatic, repo.syncNotificationsEnabled {
+                await VaultBridgeLocalNotifications.post(repo: repo, needsAttention: true)
+            }
+        }
+
+        await update(repo: repo, phase: .inspecting, message: "Checking this phone")
         do {
             var info = try await state.inspectRepositoryForVaultBridge(repoID: repoID)
             if !info.commitSHA.isEmpty {
@@ -250,16 +257,59 @@ final class VaultBridgeSyncCoordinator {
             if automatic,
                info.changeCount == 0,
                info.syncState == .upToDate,
-               remoteCheckIsFresh {
+               remoteCheckIsFresh,
+               state.shelteredEditsByRepo[repoID] == nil {
                 await update(repo: repo, phase: .complete, message: "Up to date")
                 return
             }
 
+            // An interrupted combine whose choices have all been made only
+            // needs its commit. Finish it here so the user never has to learn
+            // what "complete merge" means.
+            await state.loadConflictSession(repoID: repoID)
+            var session = state.conflictSessionByRepo[repoID] ?? .none
+            if session.kind == .merge, !session.hasConflicts {
+                await update(repo: repo, phase: .reconciling, message: "Finishing the combine")
+                await state.completeMerge(
+                    repoID: repoID,
+                    message: "Combine phone and server changes",
+                    presentsErrors: !automatic
+                )
+                await state.loadConflictSession(repoID: repoID)
+                session = state.conflictSessionByRepo[repoID] ?? .none
+                info = try await state.inspectRepositoryForVaultBridge(repoID: repoID)
+            }
+            if session.isActive {
+                await stopForAttention(Self.attentionMessage(for: session))
+                return
+            }
+
+            // Edits sheltered by an earlier combine or replacement go back
+            // first, so this save includes them.
+            if state.shelteredEditsByRepo[repoID] != nil {
+                await update(repo: repo, phase: .reconciling, message: "Putting sheltered edits back")
+                let restored = await state.restoreShelteredEdits(repoID: repoID, presentsErrors: !automatic)
+                info = try await state.inspectRepositoryForVaultBridge(repoID: repoID)
+                if !restored {
+                    await state.loadConflictSession(repoID: repoID)
+                    let message = state.pullOutcomeByRepo[repoID]?.message
+                        ?? "Sheltered edits could not be put back yet."
+                    await stopForAttention(message)
+                    return
+                }
+            }
+
             var committed = false
             var checkpointPass = 0
+            var lastPassCommitted = true
+            var entryStatesByPass: [Set<String>] = [Self.entryStateSet(info.statusEntries)]
             while info.changeCount > 0 && checkpointPass < 3 {
                 checkpointPass += 1
-                await update(repo: repo, phase: .committing, message: "Saving local checkpoint (pass \(checkpointPass))")
+                await update(
+                    repo: repo,
+                    phase: .committing,
+                    message: checkpointPass == 1 ? "Saving on this phone" : "Saving on this phone (pass \(checkpointPass))"
+                )
                 let didCommit = try await state.commitAllLocallyForVaultBridge(
                     repoID: repoID,
                     message: Self.automaticCommitMessage(),
@@ -267,6 +317,7 @@ final class VaultBridgeSyncCoordinator {
                     refreshStatus: false
                 )
                 committed = didCommit || committed
+                lastPassCommitted = didCommit
                 if didCommit {
                     if let latestSHA = state.repo(id: repoID)?.gitState.commitSHA, !latestSHA.isEmpty {
                         checkpointSHAByRepo[repoID] = latestSHA
@@ -279,82 +330,140 @@ final class VaultBridgeSyncCoordinator {
                     try await Task.sleep(for: .milliseconds(650))
                 }
                 info = try await state.inspectRepositoryForVaultBridge(repoID: repoID)
-            }
-            if info.changeCount > 0 {
-                await update(repo: repo, phase: .attention, message: "Files are still changing. Close the editor briefly, then try again.")
-                if automatic, repo.syncNotificationsEnabled {
-                    await VaultBridgeLocalNotifications.post(repo: repo, needsAttention: true)
+                entryStatesByPass.append(Self.entryStateSet(info.statusEntries))
+                if entryStatesByPass.count >= 3,
+                   entryStatesByPass[entryStatesByPass.count - 1] == entryStatesByPass[entryStatesByPass.count - 3],
+                   entryStatesByPass[entryStatesByPass.count - 1] != entryStatesByPass[entryStatesByPass.count - 2] {
+                    break
                 }
-                return
+                // Nothing was committable from this snapshot. Another pass
+                // would only stage the same entries again.
+                if !didCommit { break }
+            }
+            var stillChangingCount = 0
+            if info.changeCount > 0 {
+                let count = info.changeCount
+                // Each pass commits, yet the set of reported files alternates
+                // between two states. Git is reporting the same file
+                // inconsistently; more passes would only add commits.
+                let flipping = entryStatesByPass.count >= 3
+                    && entryStatesByPass[entryStatesByPass.count - 1] == entryStatesByPass[entryStatesByPass.count - 3]
+                    && entryStatesByPass[entryStatesByPass.count - 1] != entryStatesByPass[entryStatesByPass.count - 2]
+                if flipping {
+                    DebugLogger.shared.warning(
+                        "vaultbridge",
+                        "Checkpoint entries flip between two states",
+                        detail: "passes=\(checkpointPass) counts=\(entryStatesByPass.map(\.count))"
+                    )
+                    await stopForAttention(count == 1
+                        ? "Git reports 1 file inconsistently. VaultBridge stopped before creating another duplicate save. Open Git Tools for details."
+                        : "Git reports \(count) files inconsistently. VaultBridge stopped before creating another duplicate save. Open Git Tools for details.")
+                    return
+                }
+                if !lastPassCommitted {
+                    await stopForAttention(count == 1
+                        ? "1 file could not be saved on this phone. Open Git Tools to see it."
+                        : "\(count) files could not be saved on this phone. Open Git Tools to see them.")
+                    return
+                }
+                // Every pass saved something and files are still moving. What
+                // is saved is worth uploading now; the rest is picked up by
+                // the next sync instead of holding everything hostage.
+                stillChangingCount = count
             }
             if committed {
-                await update(repo: repo, phase: .committing, message: "Local changes committed safely")
+                await update(repo: repo, phase: .committing, message: "Saved on this phone")
             }
 
-            await update(repo: repo, phase: .fetching, message: "Downloading server information")
-            guard await state.pullWithRebase(
+            await update(repo: repo, phase: .fetching, message: "Checking the server")
+            guard await state.pullWithMerge(
                 repoID: repoID,
-                showsProgressDelay: false,
                 presentsErrors: !automatic,
                 refreshStatus: false
             ) else {
                 let outcome = state.pullOutcomeByRepo[repoID]
-                let needsAttention = outcome?.kind == .rebaseConflicts || outcome?.kind == .diverged || outcome?.kind == .blockedByLocalChanges
-                await update(
-                    repo: repo,
-                    phase: needsAttention ? .attention : .failed,
-                    message: outcome?.message ?? "Pull could not be completed"
-                )
-                if automatic, needsAttention, repo.syncNotificationsEnabled {
-                    await VaultBridgeLocalNotifications.post(repo: repo, needsAttention: true)
+                let needsAttention = outcome?.kind == .mergeConflicts
+                    || outcome?.kind == .blockedByLocalChanges
+                    || outcome?.kind == .diverged
+                let message = outcome?.message ?? "The server could not be checked"
+                if needsAttention {
+                    await stopForAttention(message)
+                } else if outcome?.kind == .cancelled {
+                    await update(repo: repo, phase: .idle, message: message)
+                } else {
+                    await update(repo: repo, phase: .failed, message: message)
                 }
                 return
             }
 
-            await update(repo: repo, phase: .comparing, message: "Comparing phone and server history")
+            await update(repo: repo, phase: .comparing, message: "Comparing phone and server")
             state.markVaultBridgeRemoteCheckSucceeded(repoID: repoID)
             let pullKind = state.pullOutcomeByRepo[repoID]?.kind
-            if pullKind == .rebased || pullKind == .fastForwarded {
-                await update(repo: repo, phase: .reconciling, message: "Applying server changes safely")
+            if pullKind == .merged || pullKind == .fastForwarded {
+                await update(repo: repo, phase: .reconciling, message: "Bringing server changes onto this phone")
             }
-            let shouldPush = committed || info.syncState == .ahead || pullKind == .rebased
+            let localHasCommits = !(state.repo(id: repoID)?.gitState.commitSHA ?? "").isEmpty
+            let shouldPush: Bool
+            switch pullKind {
+            case .merged:
+                shouldPush = true
+            case .remoteBranchMissing:
+                shouldPush = localHasCommits
+            default:
+                shouldPush = committed
+                    || info.syncState == .ahead
+                    || state.syncStateByRepo[repoID] == .ahead
+            }
             if shouldPush {
-                await update(repo: repo, phase: .pushing, message: "Uploading saved changes")
-                guard await state.pushCurrentBranch(repoID: repoID, presentsErrors: !automatic, refreshStatus: false) else {
-                // pushErrorByRepo is per-repository and cleared when each push
-                // starts, so this is the actual typed failure for THIS repo —
-                // never a stale error that another repository produced.
+                await update(repo: repo, phase: .pushing, message: "Uploading to the server")
+                guard await state.pushCurrentBranch(
+                    repoID: repoID,
+                    presentsErrors: !automatic,
+                    refreshStatus: false,
+                    preflightFetch: false
+                ) else {
+                    // pushErrorByRepo is per-repository and cleared when each
+                    // push starts, so this is the typed failure for THIS repo.
                     let pushError = state.pushErrorByRepo[repoID]
-                    let needsAttention = pushError?.isLFSRepairEligible == true
-                    await update(
-                        repo: repo,
-                        phase: needsAttention ? .attention : .failed,
-                        message: pushError?.message ?? "Push could not be completed"
-                    )
-                    if automatic, needsAttention, repo.syncNotificationsEnabled {
-                        await VaultBridgeLocalNotifications.post(repo: repo, needsAttention: true)
+                    let outcome = state.pullOutcomeByRepo[repoID]
+                    let message = pushError?.message ?? outcome?.message ?? "Upload could not be completed"
+                    if pushError?.isLFSRepairEligible == true || outcome?.kind == .diverged {
+                        await stopForAttention(message)
+                    } else if outcome?.kind == .cancelled {
+                        await update(repo: repo, phase: .idle, message: message)
+                    } else {
+                        await update(repo: repo, phase: .failed, message: message)
                     }
                     return
                 }
             }
 
-            let movedChanges = committed || info.syncState == .ahead || pullKind == .fastForwarded || pullKind == .rebased
+            let movedChanges = shouldPush || pullKind == .fastForwarded || pullKind == .merged
             let message: String
             if shouldPush {
-                message = committed ? "Committed and pushed" : "Rebased and pushed"
+                if pullKind == .merged {
+                    message = "Combined and uploaded"
+                } else if committed {
+                    message = "Saved and uploaded"
+                } else {
+                    message = "Uploaded"
+                }
             } else if pullKind == .fastForwarded {
-                message = "Pulled remote changes"
+                message = "Server notes brought onto this phone"
             } else {
                 message = "Up to date"
             }
-            await update(repo: repo, phase: .verifying, message: "Verifying phone and server state")
-            await update(repo: repo, phase: .complete, message: message)
+            await update(repo: repo, phase: .verifying, message: "Verifying phone and server")
+            let suffix = stillChangingCount == 0 ? "" : (stillChangingCount == 1
+                ? ". 1 note is still changing and will be saved next time"
+                : ". \(stillChangingCount) notes are still changing and will be saved next time")
+            await update(repo: repo, phase: .complete, message: message + suffix)
             if automatic, movedChanges, repo.syncNotificationsEnabled {
                 await VaultBridgeLocalNotifications.post(repo: repo, needsAttention: false)
             }
         } catch let error as LocalGitError {
             if case .conflictSessionInProgress = error {
-                await update(repo: repo, phase: .attention, message: error.localizedDescription)
+                await stopForAttention(error.localizedDescription)
             } else {
                 presentSyncError(error.localizedDescription, using: state, automatic: automatic)
                 await update(repo: repo, phase: .failed, message: error.localizedDescription)
@@ -366,6 +475,18 @@ final class VaultBridgeSyncCoordinator {
         } catch {
             presentSyncError(error.localizedDescription, using: state, automatic: automatic)
             await update(repo: repo, phase: .failed, message: error.localizedDescription)
+        }
+    }
+
+    static func attentionMessage(for session: ConflictSession) -> String {
+        let count = session.unmergedPaths.count
+        switch session.kind {
+        case .rebase:
+            return count > 0
+                ? "A rebase is waiting for your choice on \(count) note\(count == 1 ? "" : "s"). Open Git Tools."
+                : "A rebase is waiting to continue. Open Git Tools."
+        default:
+            return AppState.conflictChoiceMessage(count: count)
         }
     }
 
@@ -414,6 +535,15 @@ final class VaultBridgeSyncCoordinator {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return "VaultBridge automatic sync \(formatter.string(from: now))"
+    }
+
+    /// A path alone cannot reveal the add/delete two-cycle produced by a stale
+    /// index spelling. Include both status sides so the safety stop recognizes
+    /// that oscillation before another redundant checkpoint is uploaded.
+    private static func entryStateSet(_ entries: [GitStatusEntry]) -> Set<String> {
+        Set(entries.map {
+            "\($0.path)|i=\($0.indexStatus?.rawValue ?? "-")|w=\($0.workTreeStatus?.rawValue ?? "-")|old=\($0.oldPath ?? "-")"
+        })
     }
 }
 
@@ -487,18 +617,37 @@ extension AppState {
                 }
                 guard !entries.isEmpty else { throw LocalGitError.noChanges }
 
+                let commitMessage = message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "VaultBridge local commit"
+                    : message
+
                 // Apply the Git LFS auto-tracking policy (including
                 // .gitattributes) before every automatic commit. Raw staging
                 // here once let multi-gigabyte media land in history as
                 // ordinary blobs that the push validator then rejected.
                 try await repository.stageChanges(entries, lfsAutoTrack: true)
-                return try await repository.commitLocal(
-                    message: message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? "VaultBridge local commit"
-                        : message,
-                    authorName: authorName,
-                    authorEmail: authorEmail
-                )
+                do {
+                    return try await repository.commitLocal(
+                        message: commitMessage,
+                        authorName: authorName,
+                        authorEmail: authorEmail
+                    )
+                } catch LocalGitError.noChanges {
+                    // Status listed entries but staging them one path at a
+                    // time changed nothing. The index is holding something the
+                    // per-path API cannot address: a stale duplicate entry, a
+                    // spelling the filesystem cannot produce, or a stale Git
+                    // LFS pointer. Rebuilding the index from the last commit
+                    // plus the files on disk discards all of that, so escalate
+                    // to it once before reporting that the files cannot be
+                    // saved. This is the same operation as expert Force Save.
+                    try await repository.rebuildIndexFromWorkingTree(lfsAutoTrack: true)
+                    return try await repository.commitLocal(
+                        message: commitMessage,
+                        authorName: authorName,
+                        authorEmail: authorEmail
+                    )
+                }
             }
             markRepositoryMutated(repoID: repoID)
             if let index = repoIndex(id: repoID) {
@@ -527,15 +676,16 @@ extension AppState {
             let shortSHA = repo(id: repoID).map { String($0.gitState.commitSHA.prefix(7)) } ?? ""
             syncProgress = committed
                 ? "Saved on this iPhone as \(shortSHA). Not uploaded."
-                : "Already saved on this iPhone at \(shortSHA). Nothing new to commit."
+                : "Already saved on this iPhone at \(shortSHA). Nothing new to save."
             pullOutcomeByRepo[repoID] = PullOutcomeState(
-                kind: .upToDate,
+                kind: .saved,
                 message: syncProgress,
                 date: Date()
             )
             return true
         } catch is CancellationError {
             syncProgress = "Save cancelled"
+            pullOutcomeByRepo[repoID] = PullOutcomeState(kind: .cancelled, message: syncProgress, date: Date())
             return false
         } catch {
             showError(message: error.localizedDescription, category: "commit")

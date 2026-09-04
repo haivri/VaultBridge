@@ -96,6 +96,14 @@ struct VaultBridgeRepoSettingsView: View {
                 }
 
                 Section {
+                    NavigationLink("Debug Log") { DebugLogView() }
+                } header: {
+                    Text("Diagnostics")
+                } footer: {
+                    Text("Timings, step names, and error text only. Never file names, vault contents, credentials, or paths.")
+                }
+
+                Section {
                     Button("Remove from VaultBridge", role: .destructive) {
                         showRemoveConfirmation = true
                     }

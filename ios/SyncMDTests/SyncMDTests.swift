@@ -15,13 +15,28 @@ final class SyncMDTests: XCTestCase {
         XCTAssertTrue(true)
     }
 
-    func testPrimaryActionUsesPlainLanguageRepositoryState() {
-        XCTAssertEqual(VaultBridgePrimaryAction.choose(changeCount: 2, syncState: .diverged, conflictCount: 0), .saveOnPhone)
-        XCTAssertEqual(VaultBridgePrimaryAction.choose(changeCount: 0, syncState: .behind, conflictCount: 0), .getServerUpdates)
-        XCTAssertEqual(VaultBridgePrimaryAction.choose(changeCount: 0, syncState: .ahead, conflictCount: 0), .uploadSavedChanges)
-        XCTAssertEqual(VaultBridgePrimaryAction.choose(changeCount: 0, syncState: .diverged, conflictCount: 0), .combineChanges)
-        XCTAssertEqual(VaultBridgePrimaryAction.choose(changeCount: 4, syncState: .diverged, conflictCount: 1), .resolveConflicts)
-        XCTAssertEqual(VaultBridgePrimaryAction.choose(changeCount: 0, syncState: .upToDate, conflictCount: 0), .checkAgain)
+    func testPrimaryActionIsSyncUnlessAHumanChoiceIsNeeded() {
+        // Save, fetch, combine, and upload are one workflow the app runs
+        // itself. The only state that needs a person is a conflict.
+        XCTAssertEqual(VaultBridgePrimaryAction.choose(conflictCount: 0), .syncNow)
+        XCTAssertEqual(VaultBridgePrimaryAction.choose(conflictCount: 1), .resolveConflicts)
+        XCTAssertEqual(VaultBridgePrimaryAction.choose(conflictCount: 4), .resolveConflicts)
+    }
+
+    func testOutcomeKindsCarryPresentationToneWithoutViewSwitches() {
+        XCTAssertEqual(PullOutcomeKind.saved.tone, .success)
+        XCTAssertEqual(PullOutcomeKind.merged.tone, .success)
+        XCTAssertEqual(PullOutcomeKind.restored.tone, .info)
+        XCTAssertEqual(PullOutcomeKind.mergeConflicts.tone, .attention)
+        XCTAssertEqual(PullOutcomeKind.failed.tone, .failure)
+        XCTAssertEqual(PullOutcomeKind.cancelled.tone, .neutral)
+    }
+
+    func testPlainPushFailureMessageExplainsRejectedUpload() {
+        let rejected = LocalGitError.pushFailed("cannot push because a reference that you are trying to update on the remote contains commits that are not present locally.")
+        XCTAssertTrue(AppState.plainPushFailureMessage(for: rejected).contains("Sync Now combines"))
+        let other = LocalGitError.pushFailed("No remote 'origin' configured.")
+        XCTAssertEqual(AppState.plainPushFailureMessage(for: other), other.localizedDescription)
     }
 
     func testCapturedStatusSnapshotStagesOnlyThosePaths() async throws {
@@ -122,6 +137,29 @@ final class SyncMDTests: XCTestCase {
         XCTAssertNil(appState.pendingLFSAutoTrackingConfirmation)
         XCTAssertEqual(fixture.repository.stagedPaths, ["Video.mov"])
         XCTAssertEqual(fixture.repository.lfsAutoTrackStageFlags, [true])
+    }
+
+    @MainActor
+    func testRepairMissingLFSObjectsBackfillsWithoutPushingGitHistory() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.backfillLFSResult = GitLFSBackfillResult(
+            referencedCount: 12,
+            uploadedCount: 3
+        )
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+
+        let repaired = await state.repairMissingLFSObjects(repoID: fixture.repoConfig.id)
+
+        XCTAssertTrue(repaired)
+        XCTAssertEqual(fixture.repository.backfillLFSCallCount, 1)
+        XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 0)
+        XCTAssertEqual(fixture.repository.commitLocalCallCount, 0)
+        XCTAssertTrue(state.pullOutcomeByRepo[fixture.repoConfig.id]?.message.contains("3 missing attachment backups") == true)
     }
 
     func testOAuthCallbackParserValidatesURLStateBeforeToken() throws {
@@ -812,6 +850,391 @@ final class SyncMDTests: XCTestCase {
         XCTAssertEqual(fixture.repository.mergeBranchCallCount, 1)
         XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 0)
         XCTAssertTrue(state.pullOutcomeByRepo[fixture.repoConfig.id]?.message.contains("Nothing was uploaded") == true)
+        // The server is contacted before any phone file is touched.
+        XCTAssertEqual(fixture.repository.operationLog.first, "pullPlan")
+    }
+
+    @MainActor
+    func testSafeServerMergeRefusesOfflineBeforeTouchingPhoneFiles() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        fixture.repository.pullPlanError = LocalGitError.fetchFailed("network down")
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+
+        await state.mergeWithRemote(repoID: fixture.repoConfig.id)
+
+        XCTAssertEqual(fixture.repository.commitLocalCallCount, 0)
+        XCTAssertTrue(fixture.repository.savedStashes.isEmpty, "Offline must never strand edits in a stash")
+        XCTAssertEqual(fixture.repository.mergeBranchCallCount, 0)
+        XCTAssertTrue(state.showError)
+        XCTAssertNil(state.shelteredEditsByRepo[fixture.repoConfig.id])
+    }
+
+    @MainActor
+    func testSafeServerMergeRecordsShelterWhenMergeStopsForConflicts() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        // The checkpoint commits nothing and files stay dirty, so the merge
+        // must shelter them; the merge then stops for conflicts.
+        fixture.repository.commitLocalError = LocalGitError.noChanges
+        fixture.repository.mergeBranchError = LocalGitError.mergeConflictsDetected
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+
+        // The stash empties the working tree.
+        fixture.repository.onSaveStash = { repository in
+            repository.repoInfoResult = LocalRepoInfo(
+                branch: "main",
+                commitSHA: repository.repoInfoResult.commitSHA,
+                changeCount: 0,
+                statusEntries: []
+            )
+        }
+        await state.mergeWithRemote(repoID: fixture.repoConfig.id)
+
+        XCTAssertEqual(fixture.repository.savedStashes.count, 1)
+        XCTAssertTrue(fixture.repository.appliedStashIndices.isEmpty, "A conflicted merge must not re-apply the shelf on top of conflict markers")
+        let sheltered = try XCTUnwrap(state.shelteredEditsByRepo[fixture.repoConfig.id])
+        XCTAssertEqual(sheltered.stashMessage, fixture.repository.savedStashes[0].message)
+        XCTAssertEqual(state.pullOutcomeByRepo[fixture.repoConfig.id]?.kind, .mergeConflicts)
+        state.shelteredEditsByRepo.removeAll()
+    }
+
+    @MainActor
+    func testCompletingMergePutsShelteredEditsBack() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.stashEntriesResult = [GitStashEntry(index: 0, oid: "abc", message: "VaultBridge temporary shelf X")]
+        fixture.repository.mergeFinalizeResult = MergeFinalizeResult(newCommitSHA: "cccccccccccccccccccccccccccccccccccccccc")
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+        state.shelteredEditsByRepo[fixture.repoConfig.id] = VaultBridgeShelteredEdits(stashMessage: "VaultBridge temporary shelf X", reason: "test")
+
+        await state.completeMerge(repoID: fixture.repoConfig.id)
+
+        XCTAssertEqual(fixture.repository.completeMergeCallCount, 1)
+        XCTAssertEqual(fixture.repository.appliedStashIndices, [0])
+        XCTAssertNil(state.shelteredEditsByRepo[fixture.repoConfig.id])
+        XCTAssertEqual(state.pullOutcomeByRepo[fixture.repoConfig.id]?.kind, .restored)
+    }
+
+    @MainActor
+    func testUploadChecksServerFirstAndReclassifiesInsteadOfLooping() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.pullPlanResult = PullPlan(
+            action: .diverged,
+            branch: "main",
+            localCommitSHA: fixture.repoConfig.gitState.commitSHA,
+            remoteCommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            hasLocalChanges: false,
+            aheadBy: 1,
+            behindBy: 2
+        )
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+        state.syncStateByRepo[fixture.repoConfig.id] = .ahead
+
+        let uploaded = await state.pushCurrentBranch(repoID: fixture.repoConfig.id)
+
+        XCTAssertFalse(uploaded)
+        XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 0, "Never push blind onto a server that moved")
+        XCTAssertEqual(state.syncStateByRepo[fixture.repoConfig.id], .diverged)
+        XCTAssertEqual(state.pullOutcomeByRepo[fixture.repoConfig.id]?.kind, .diverged)
+        XCTAssertFalse(state.showError, "A moved server is a normal state, not an error")
+        XCTAssertEqual(state.repos.first?.gitState.remoteCommitSHA, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    }
+
+    @MainActor
+    func testCoordinatorCombinesDivergedHistoriesWithMergeThenUploads() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.pullPlanResult = PullPlan(
+            action: .diverged,
+            branch: "main",
+            localCommitSHA: fixture.repoConfig.gitState.commitSHA,
+            remoteCommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            hasLocalChanges: false,
+            aheadBy: 1,
+            behindBy: 1
+        )
+        fixture.repository.mergeResult = MergeResult(
+            kind: .mergeCommitted,
+            sourceBranch: "origin/main",
+            newCommitSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        )
+        fixture.repository.onMergeBranch = { repository in
+            // A real repository reports the merge commit as HEAD afterwards.
+            repository.repoInfoResult = LocalRepoInfo(
+                branch: "main",
+                commitSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                changeCount: 0,
+                syncState: .ahead
+            )
+        }
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+        let coordinator = VaultBridgeSyncCoordinator()
+
+        await coordinator.sync(repoID: fixture.repoConfig.id, using: state)
+
+        XCTAssertEqual(coordinator.status(for: fixture.repoConfig.id).phase, .complete)
+        XCTAssertEqual(coordinator.status(for: fixture.repoConfig.id).message, "Combined and uploaded")
+        XCTAssertEqual(fixture.repository.mergeBranchCallCount, 1)
+        XCTAssertEqual(fixture.repository.pullRebaseCallCount, 0, "The automatic workflow never rewrites phone commits")
+        XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 1)
+        XCTAssertEqual(state.repos.first?.gitState.commitSHA, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        XCTAssertFalse(state.showError)
+    }
+
+    @MainActor
+    func testCoordinatorStopsWithChoiceMessageWhenMergeConflicts() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.pullPlanResult = PullPlan(
+            action: .diverged,
+            branch: "main",
+            localCommitSHA: fixture.repoConfig.gitState.commitSHA,
+            remoteCommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            hasLocalChanges: false,
+            aheadBy: 1,
+            behindBy: 1
+        )
+        fixture.repository.mergeBranchError = LocalGitError.mergeConflictsDetected
+        fixture.repository.onMergeBranch = { repository in
+            repository.conflictSessionResult = ConflictSession(kind: .merge, unmergedPaths: ["Inbox.md", "Daily.md"])
+        }
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+        let coordinator = VaultBridgeSyncCoordinator()
+
+        await coordinator.sync(repoID: fixture.repoConfig.id, using: state)
+
+        let status = coordinator.status(for: fixture.repoConfig.id)
+        XCTAssertEqual(status.phase, .attention)
+        XCTAssertEqual(status.message, "2 notes need your choice between the phone and server copies.")
+        XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 0)
+        XCTAssertFalse(state.showError)
+    }
+
+    @MainActor
+    func testCoordinatorFinishesResolvedMergeInsteadOfAskingUserToCompleteIt() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.conflictSessionResult = ConflictSession(kind: .merge, unmergedPaths: [])
+        fixture.repository.mergeFinalizeResult = MergeFinalizeResult(newCommitSHA: "cccccccccccccccccccccccccccccccccccccccc")
+        fixture.repository.onCompleteMerge = { repository in
+            repository.conflictSessionResult = .none
+            repository.pullPlanResult = PullPlan(
+                action: .upToDate, branch: "main",
+                localCommitSHA: "cccccccccccccccccccccccccccccccccccccccc",
+                remoteCommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                hasLocalChanges: false, aheadBy: 2, behindBy: 0
+            )
+        }
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+        let coordinator = VaultBridgeSyncCoordinator()
+
+        await coordinator.sync(repoID: fixture.repoConfig.id, using: state)
+
+        XCTAssertEqual(fixture.repository.completeMergeCallCount, 1)
+        XCTAssertEqual(coordinator.status(for: fixture.repoConfig.id).phase, .complete)
+        XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 1)
+    }
+
+    @MainActor
+    func testCheckpointEscalatesToWholeTreeStagingWhenPerPathStagingChangesNothing() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        // Per-path staging leaves the index equal to HEAD (an index entry the
+        // path API cannot address); libgit2's add-all/update-all pass succeeds.
+        fixture.repository.commitLocalErrorQueue = [LocalGitError.noChanges, nil]
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+        let coordinator = VaultBridgeSyncCoordinator()
+
+        await coordinator.sync(repoID: fixture.repoConfig.id, using: state)
+
+        XCTAssertEqual(fixture.repository.rebuildIndexCallCount, 1)
+        XCTAssertEqual(fixture.repository.lfsAutoTrackStageFlags.last, true, "The escalation must keep the LFS policy")
+        XCTAssertEqual(fixture.repository.commitLocalCallCount, 2)
+        XCTAssertEqual(coordinator.status(for: fixture.repoConfig.id).phase, .complete)
+        XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 1)
+    }
+
+    @MainActor
+    func testForceSaveRebuildsIndexAndCommitsWithoutUploading() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+
+        let ok = await state.forceSaveOnPhone(repoID: fixture.repoConfig.id)
+
+        XCTAssertTrue(ok)
+        XCTAssertEqual(fixture.repository.rebuildIndexCallCount, 1)
+        XCTAssertEqual(fixture.repository.lfsAutoTrackStageFlags.last, true)
+        XCTAssertEqual(fixture.repository.commitLocalCallCount, 1)
+        XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 0)
+        XCTAssertEqual(state.pullOutcomeByRepo[fixture.repoConfig.id]?.kind, .saved)
+        XCTAssertFalse(state.showError)
+    }
+
+    @MainActor
+    func testForceSaveRefusesDuringConflictSession() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        fixture.repository.conflictSessionResult = ConflictSession(kind: .merge, unmergedPaths: ["Inbox.md"])
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+
+        let ok = await state.forceSaveOnPhone(repoID: fixture.repoConfig.id)
+
+        XCTAssertFalse(ok)
+        XCTAssertEqual(fixture.repository.rebuildIndexCallCount, 0)
+        XCTAssertEqual(fixture.repository.commitLocalCallCount, 0)
+        XCTAssertTrue(state.showError)
+    }
+
+    @MainActor
+    func testCoordinatorReportsUncommittableFilesInsteadOfClaimingTheyAreChanging() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        fixture.repository.commitLocalError = LocalGitError.noChanges
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+        let coordinator = VaultBridgeSyncCoordinator()
+
+        await coordinator.sync(repoID: fixture.repoConfig.id, using: state)
+
+        let status = coordinator.status(for: fixture.repoConfig.id)
+        XCTAssertEqual(status.phase, .attention)
+        XCTAssertTrue(status.message.contains("could not be saved"), status.message)
+        XCTAssertEqual(fixture.repository.rebuildIndexCallCount, 1, "One index rebuild, then stop")
+        XCTAssertEqual(fixture.repository.commitLocalCallCount, 2, "Re-staging the same uncommittable snapshot a third time is pointless")
+        XCTAssertEqual(fixture.repository.pullPlanCallCount, 0)
+        XCTAssertFalse(state.showError)
+    }
+
+    @MainActor
+    func testRestoreProtectedBackupProtectsCurrentWorkFirst() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+        state.recoveryByRepo[fixture.repoConfig.id] = GitRecoverySnapshot(
+            referenceName: "refs/vaultbridge/recovery/old",
+            commitSHA: "dddddddddddddddddddddddddddddddddddddddd",
+            stashMessage: "VaultBridge protected recovery OLD"
+        )
+        fixture.repository.stashEntriesResult = [GitStashEntry(index: 0, oid: "old", message: "VaultBridge protected recovery OLD")]
+
+        await state.restoreProtectedRecovery(repoID: fixture.repoConfig.id)
+
+        let log = fixture.repository.operationLog
+        let stashIndex = try XCTUnwrap(log.firstIndex(of: "saveStash"))
+        let snapshotIndex = try XCTUnwrap(log.firstIndex(of: "createRecoveryReference"))
+        let resetIndex = try XCTUnwrap(log.firstIndex(of: "hardReset"))
+        XCTAssertLessThan(stashIndex, resetIndex, "Dirty files must be stashed before the reset")
+        XCTAssertLessThan(snapshotIndex, resetIndex, "The current commit must be referenced before the reset")
+        XCTAssertEqual(fixture.repository.hardResetReferences, ["refs/vaultbridge/recovery/old"])
+        // Restore is reversible: the state just left is now the protected backup.
+        let newRecovery = try XCTUnwrap(state.recoveryByRepo[fixture.repoConfig.id])
+        XCTAssertNotEqual(newRecovery.referenceName, "refs/vaultbridge/recovery/old")
+        XCTAssertNotNil(newRecovery.stashMessage)
+        XCTAssertEqual(state.pullOutcomeByRepo[fixture.repoConfig.id]?.kind, .restored)
+        XCTAssertFalse(state.showError)
+    }
+
+    @MainActor
+    func testEmergencyReplaceChecksServerFirstAndUsesCheckedOutBranch() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        // Configured branch is main, but "notes" is what is checked out.
+        fixture.repository.repoInfoResult = LocalRepoInfo(
+            branch: "notes",
+            commitSHA: fixture.repoInfo.commitSHA,
+            changeCount: fixture.repoInfo.changeCount,
+            statusEntries: fixture.repoInfo.statusEntries
+        )
+        fixture.repository.pullPlanResult = PullPlan(
+            action: .diverged, branch: "notes",
+            localCommitSHA: fixture.repoInfo.commitSHA,
+            remoteCommitSHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            hasLocalChanges: true, aheadBy: 1, behindBy: 1
+        )
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+
+        await state.replacePhoneCopyWithServer(repoID: fixture.repoConfig.id)
+
+        let log = fixture.repository.operationLog
+        XCTAssertEqual(log.first, "pullPlan", "Reach the server before touching any phone file")
+        XCTAssertEqual(fixture.repository.hardResetReferences, ["refs/remotes/origin/notes"])
+        XCTAssertEqual(fixture.repository.savedStashes.count, 1)
+        XCTAssertNotNil(state.recoveryByRepo[fixture.repoConfig.id])
+        XCTAssertFalse(state.showError)
+        state.recoveryByRepo.removeAll()
+    }
+
+    @MainActor
+    func testEmergencyReplaceOfflineLeavesPhoneUntouched() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        fixture.repository.pullPlanError = LocalGitError.fetchFailed("network down")
+        let state = AppState(
+            gitRepositoryFactory: { _ in fixture.repository },
+            loadPersistedState: false
+        )
+        state.repos = [fixture.repoConfig]
+
+        await state.replacePhoneCopyWithServer(repoID: fixture.repoConfig.id)
+
+        XCTAssertTrue(fixture.repository.savedStashes.isEmpty)
+        XCTAssertTrue(fixture.repository.hardResetReferences.isEmpty)
+        XCTAssertNil(state.recoveryByRepo[fixture.repoConfig.id])
+        XCTAssertTrue(state.showError)
     }
 
     @MainActor
@@ -2350,6 +2773,45 @@ final class SyncMDTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "remote\n")
     }
 
+    func testLocalGitPullOnlyRestoresLFSPointerStubWhenAlreadyUpToDate() async throws {
+        let repoURL = try makeTemporaryGitRepository(prefix: "SyncMD-PullOnlyLFSRestore")
+        let originURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SyncMD-PullOnlyLFSRestore-Origin-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: repoURL)
+            try? FileManager.default.removeItem(at: originURL)
+        }
+
+        try "*.pdf filter=lfs diff=lfs merge=lfs -text\n".write(
+            to: repoURL.appendingPathComponent(".gitattributes"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let fileURL = repoURL.appendingPathComponent("Manual.pdf")
+        let realData = Data("%PDF-1.7\nrestorable attachment\n".utf8)
+        try realData.write(to: fileURL)
+
+        let service = LocalGitService(localURL: repoURL)
+        try await service.stageAll()
+        let commitSHA = try await service.commitLocal(
+            message: "Add LFS attachment",
+            authorName: "Tests",
+            authorEmail: "tests@example.com"
+        )
+        let pointerData = try XCTUnwrap(headTreeBlobData(repoURL: repoURL, path: "Manual.pdf"))
+        XCTAssertNotNil(GitLFSPointer(data: pointerData))
+        try pointerData.write(to: fileURL)
+
+        try makeBareOrigin(at: originURL, copyingObjectsFrom: repoURL, headSHA: commitSHA)
+        try setLocalAndRemoteTrackingRefs(repoURL: repoURL, localSHA: commitSHA, remoteSHA: commitSHA)
+        try await service.setRemoteURL(name: "origin", url: "file://localhost\(originURL.path)")
+
+        let execution = try await service.executePullOnly(pat: "", expectedBranch: "main")
+
+        XCTAssertEqual(execution.plan.action, .upToDate)
+        XCTAssertEqual(try Data(contentsOf: fileURL), realData)
+    }
+
     func testPullPlanClassifierDistinguishesFastForwardBlockedAndDiverged() {
         XCTAssertEqual(
             LocalGitService.classifyPullAction(ahead: 0, behind: 3, hasLocalChanges: false),
@@ -3417,6 +3879,331 @@ final class SyncMDTests: XCTestCase {
         XCTAssertEqual(detail.message, "Update README")
         XCTAssertEqual(detail.parentOIDs.count, 1)
         XCTAssertTrue(detail.changedFiles.contains(where: { $0.path == "README.md" && $0.changeType == .modified }))
+    }
+
+    func testIndexEntryInAnotherUnicodeFormIsSavedNotStuckAsDeleted() async throws {
+        let fm = FileManager.default
+        let repoURL = fm.temporaryDirectory.appendingPathComponent("SyncMD-UnicodeTwin-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: repoURL) }
+
+        var repo: OpaquePointer?
+        XCTAssertEqual(git_repository_init(&repo, repoURL.path, 0), 0)
+        if let repo { git_repository_free(repo) }
+
+        // Another tool committed the attachment under a decomposed (NFD) name;
+        // the phone's disk and status see the precomposed (NFC) form.
+        let nfd = "attachments/Brahmananda Swarupa/Pasted image caf\u{0065}\u{0301}.jpg"
+        let nfc = nfd.precomposedStringWithCanonicalMapping
+        XCTAssertNotEqual(Array(nfd.utf8), Array(nfc.utf8))
+        try fm.createDirectory(at: repoURL.appendingPathComponent("attachments/Brahmananda Swarupa"), withIntermediateDirectories: true)
+        try Data(repeating: 0xAB, count: 1024).write(to: repoURL.appendingPathComponent(nfd))
+        try "note\n".write(to: repoURL.appendingPathComponent("Note.md"), atomically: true, encoding: .utf8)
+        let service = LocalGitService(localURL: repoURL)
+        // Fresh repository: precomposeunicode is not set yet, so the raw NFD
+        // bytes land in the index exactly as a desktop tool would write them.
+        try await service.stage(path: nfd)
+        try await service.stage(path: "Note.md")
+        let base = try await service.commitLocal(message: "Base", authorName: "T", authorEmail: "t@example.com")
+
+        // The first inspection turns on core.precomposeunicode; from then on
+        // libgit2 sees the NFD index entry as missing from an NFC disk.
+        var info = try await service.repoInfo()
+        if info.statusEntries.isEmpty { info = try await service.repoInfo() }
+        // Status must not report the same file twice under two spellings.
+        XCTAssertEqual(Set(info.statusEntries.map(\.path)).count, info.statusEntries.count)
+        XCTAssertEqual(info.statusEntries.count, 1, "\(info.statusEntries)")
+        let entry = try XCTUnwrap(info.statusEntries.first)
+        XCTAssertEqual(entry.path, nfc)
+        XCTAssertEqual(entry.workTreeStatus, .renamed, "A file that is on disk is not deleted; its index name form is")
+        XCTAssertEqual(entry.oldPath.map { Array($0.utf8) }, Array(nfd.utf8))
+
+        // A normal save records the normalization once and the vault is clean.
+        try await service.stageChanges(info.statusEntries, lfsAutoTrack: false)
+        let next = try await service.commitLocal(message: "Normalize", authorName: "T", authorEmail: "t@example.com")
+        XCTAssertNotEqual(next, base)
+        let after = try await service.repoInfo()
+        XCTAssertTrue(after.statusEntries.isEmpty, "\(after.statusEntries)")
+        let detail = try await service.commitDetail(oid: next)
+        XCTAssertFalse(detail.changedFiles.isEmpty)
+    }
+
+    func testStoredWorktreePathKeepsActualBytesForAutoNoteMoverRename() throws {
+        let fm = FileManager.default
+        let repoURL = fm.temporaryDirectory.appendingPathComponent(
+            "SyncMD-AutoNoteMoverPath-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: repoURL) }
+
+        let folderNFD = "attachments/Brahmananda Swarupa caf\u{0065}\u{0301}"
+        let fileNFD = "dada-dada-dada caf\u{0065}\u{0301}.jpg"
+        let rawPath = folderNFD + "/" + fileNFD
+        let normalizedPath = rawPath.precomposedStringWithCanonicalMapping
+        XCTAssertNotEqual(Array(rawPath.utf8), Array(normalizedPath.utf8))
+
+        try fm.createDirectory(
+            at: repoURL.appendingPathComponent(folderNFD),
+            withIntermediateDirectories: true
+        )
+        try Data(repeating: 0x7A, count: 128).write(to: repoURL.appendingPathComponent(rawPath))
+
+        let resolved = try XCTUnwrap(
+            LocalGitService.workdirStoredForm(of: normalizedPath, in: repoURL)
+        )
+        XCTAssertEqual(Array(resolved.utf8), Array(rawPath.utf8),
+                       "Staging must use the filename bytes AutoNoteMover actually wrote")
+    }
+
+    func testFileProviderPhantomDeleteIsIgnoredOnlyWhenDiskMatchesIndexBlob() async throws {
+        let fm = FileManager.default
+        let repoURL = fm.temporaryDirectory.appendingPathComponent(
+            "SyncMD-FileProviderIdentity-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: repoURL) }
+        var initializedRepo: OpaquePointer?
+        XCTAssertEqual(git_repository_init(&initializedRepo, repoURL.path, 0), 0)
+        if let initializedRepo { git_repository_free(initializedRepo) }
+
+        let path = "attachments/Brahmananda Swarupa/3192491EF2DE176C274BB75DA10439AC--20260903-211241--cover.jpg"
+        try fm.createDirectory(
+            at: repoURL.appendingPathComponent("attachments/Brahmananda Swarupa"),
+            withIntermediateDirectories: true
+        )
+        let original = Data(repeating: 0xA7, count: 434_763)
+        try original.write(to: repoURL.appendingPathComponent(path))
+        let service = LocalGitService(localURL: repoURL)
+        try await service.stage(path: path)
+        _ = try await service.commitLocal(message: "Seed", authorName: "T", authorEmail: "t@example.com")
+
+        var repo: OpaquePointer?
+        defer { if let repo { git_repository_free(repo) } }
+        XCTAssertEqual(git_repository_open(&repo, repoURL.path), 0)
+        var index: OpaquePointer?
+        defer { if let index { git_index_free(index) } }
+        XCTAssertEqual(git_repository_index(&index, repo), 0)
+        XCTAssertTrue(LocalGitService.workdirFileMatchesIndexBlob(
+            repo: repo, index: index, repositoryURL: repoURL, indexPath: path, diskPath: path
+        ))
+
+        try Data(repeating: 0xB8, count: original.count).write(to: repoURL.appendingPathComponent(path))
+        XCTAssertFalse(LocalGitService.workdirFileMatchesIndexBlob(
+            repo: repo, index: index, repositoryURL: repoURL, indexPath: path, diskPath: path
+        ), "A real same-size edit must still be saved")
+    }
+
+    /// Every combination of on-disk spelling and index spelling must converge
+    /// to a clean vault within a few save passes, never ping-pong.
+    func testUnicodeSpellingMismatchesConvergeInsteadOfPingPonging() async throws {
+        let nfd = "attachments/Brahmananda Swarupa/Pasted image caf\u{0065}\u{0301}.jpg"
+        let nfc = nfd.precomposedStringWithCanonicalMapping
+        let cases: [(disk: String, index: [String], label: String)] = [
+            (nfd, [nfd], "disk NFD, index NFD"),
+            (nfc, [nfd], "disk NFC, index NFD"),
+            (nfd, [nfc], "disk NFD, index NFC"),
+            (nfc, [nfc], "disk NFC, index NFC"),
+            (nfd, [nfd, nfc], "disk NFD, index both"),
+            (nfc, [nfd, nfc], "disk NFC, index both"),
+        ]
+        for testCase in cases {
+            let fm = FileManager.default
+            let repoURL = fm.temporaryDirectory.appendingPathComponent("SyncMD-Spelling-\(UUID().uuidString)", isDirectory: true)
+            try fm.createDirectory(at: repoURL, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: repoURL) }
+            var repo: OpaquePointer?
+            XCTAssertEqual(git_repository_init(&repo, repoURL.path, 0), 0)
+            if let repo { git_repository_free(repo) }
+
+            try fm.createDirectory(at: repoURL.appendingPathComponent("attachments/Brahmananda Swarupa"), withIntermediateDirectories: true)
+            try Data(repeating: 0xAB, count: 1024).write(to: repoURL.appendingPathComponent(testCase.disk))
+            let service = LocalGitService(localURL: repoURL)
+            // Seed the index with the raw spellings another tool would write
+            // (precomposeunicode is still off on a fresh repository).
+            for spelling in testCase.index { try await service.stage(path: spelling) }
+            _ = try await service.commitLocal(message: "Seed", authorName: "T", authorEmail: "t@example.com")
+
+            var commits = 0
+            var lastCount = -1
+            for pass in 1...4 {
+                let info = try await service.repoInfo()
+                lastCount = info.statusEntries.count
+                if info.statusEntries.isEmpty { break }
+                try await service.stageChanges(info.statusEntries, lfsAutoTrack: false)
+                do {
+                    _ = try await service.commitLocal(message: "Pass \(pass)", authorName: "T", authorEmail: "t@example.com")
+                    commits += 1
+                } catch LocalGitError.noChanges {
+                    try await service.stageAll(lfsAutoTrack: false)
+                    _ = try await service.commitLocal(message: "Pass \(pass) all", authorName: "T", authorEmail: "t@example.com")
+                    commits += 1
+                }
+            }
+            let final = try await service.repoInfo()
+            XCTAssertTrue(final.statusEntries.isEmpty, "\(testCase.label): still dirty after \(commits) commits, last count \(lastCount): \(final.statusEntries)")
+            XCTAssertLessThanOrEqual(commits, 1, "\(testCase.label): needed \(commits) commits to converge")
+            XCTAssertTrue(fm.fileExists(atPath: repoURL.appendingPathComponent(nfc).path), "\(testCase.label): the file must survive")
+        }
+    }
+
+    /// A folder whose names sort differently case-sensitively and
+    /// case-insensitively must not make status report one file twice.
+    func testMixedCaseFolderDoesNotReportSameFileAsDeletedAndNew() async throws {
+        let fm = FileManager.default
+        let repoURL = fm.temporaryDirectory.appendingPathComponent("SyncMD-CaseSort-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: repoURL) }
+        var repo: OpaquePointer?
+        XCTAssertEqual(git_repository_init(&repo, repoURL.path, 0), 0)
+        var config: OpaquePointer?
+        XCTAssertEqual(git_repository_config(&config, repo), 0)
+        XCTAssertEqual(git_config_set_bool(config, "core.ignorecase", 1), 0)
+        git_config_free(config)
+        if let repo { git_repository_free(repo) }
+
+        let folder = "attachments/Brahmananda Swarupa"
+        try fm.createDirectory(at: repoURL.appendingPathComponent(folder), withIntermediateDirectories: true)
+        let names = [
+            "3192491EF2DE176C274BB75DA10439AC--20260903-151536--Pasted image 20260903151536.jpg",
+            "a note.md", "B image.jpg", "_draft.md", "Zed.md", "9F2A--x.jpg", "zeta.md", "Pasted image 1.jpg"
+        ]
+        for name in names {
+            try Data(name.utf8).write(to: repoURL.appendingPathComponent(folder).appendingPathComponent(name))
+        }
+        let service = LocalGitService(localURL: repoURL)
+        try await service.stageAll()
+        _ = try await service.commitLocal(message: "Seed", authorName: "T", authorEmail: "t@example.com")
+
+        // Touch the target then save it, the way the phone did, several times.
+        let target = "\(folder)/\(names[0])"
+        for pass in 1...4 {
+            var info = try await service.repoInfo()
+            if pass == 1 {
+                try Data("edited".utf8).write(to: repoURL.appendingPathComponent(target))
+                info = try await service.repoInfo()
+            }
+            let paths = info.statusEntries.map(\.path)
+            XCTAssertEqual(Set(paths).count, paths.count, "pass \(pass): duplicate paths \(paths)")
+            if info.statusEntries.isEmpty { break }
+            try await service.stageChanges(info.statusEntries, lfsAutoTrack: false)
+            do {
+                _ = try await service.commitLocal(message: "Pass \(pass)", authorName: "T", authorEmail: "t@example.com")
+            } catch LocalGitError.noChanges {
+                try await service.stageAll(lfsAutoTrack: false)
+                _ = try await service.commitLocal(message: "Pass \(pass) all", authorName: "T", authorEmail: "t@example.com")
+            }
+        }
+        let final = try await service.repoInfo()
+        XCTAssertTrue(final.statusEntries.isEmpty, "still dirty: \(final.statusEntries)")
+    }
+
+    func testCaseMismatchedIndexSpellingConvergesForAutoNoteMoverImage() async throws {
+        let fm = FileManager.default
+        let repoURL = fm.temporaryDirectory.appendingPathComponent(
+            "SyncMD-AutoNoteMoverCase-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: repoURL) }
+        var repo: OpaquePointer?
+        XCTAssertEqual(git_repository_init(&repo, repoURL.path, 0), 0)
+        var config: OpaquePointer?
+        XCTAssertEqual(git_repository_config(&config, repo), 0)
+        // Reproduce an external iPhone repo whose config was created with the
+        // wrong case-sensitivity setting.
+        XCTAssertEqual(git_config_set_bool(config, "core.ignorecase", 0), 0)
+        git_config_free(config)
+        if let repo { git_repository_free(repo) }
+
+        let actualFolder = "attachments/Brahmananda Swarupa"
+        let indexedFolder = "attachments/Brahmananda swarupa"
+        let name = "3192491EF2DE176C274BB75DA10439AC--20260903-211241--cover.jpg"
+        let actualPath = "\(actualFolder)/\(name)"
+        let indexedPath = "\(indexedFolder)/\(name)"
+        try fm.createDirectory(at: repoURL.appendingPathComponent(indexedFolder), withIntermediateDirectories: true)
+        let image = Data(repeating: 0xA7, count: 434_763)
+        try image.write(to: repoURL.appendingPathComponent(indexedPath))
+
+        let service = LocalGitService(localURL: repoURL)
+        // Seed the index, then reproduce AutoNoteMover correcting only the
+        // folder's case on disk. Use an intermediate name so this works on
+        // both case-sensitive and case-insensitive test volumes.
+        try await service.stage(path: indexedPath)
+        _ = try await service.commitLocal(message: "Seed stale spelling", authorName: "T", authorEmail: "t@example.com")
+        let intermediateFolder = "attachments/VaultBridge-case-move"
+        try fm.moveItem(
+            at: repoURL.appendingPathComponent(indexedFolder),
+            to: repoURL.appendingPathComponent(intermediateFolder)
+        )
+        try fm.moveItem(
+            at: repoURL.appendingPathComponent(intermediateFolder),
+            to: repoURL.appendingPathComponent(actualFolder)
+        )
+
+        let before = try await service.repoInfo()
+        XCTAssertEqual(before.statusEntries.count, 1, "\(before.statusEntries)")
+        let entry = try XCTUnwrap(before.statusEntries.first)
+        XCTAssertEqual(entry.path, actualPath)
+        XCTAssertEqual(entry.oldPath, indexedPath)
+        XCTAssertEqual(entry.workTreeStatus, .renamed)
+
+        try await service.stageChanges(before.statusEntries, lfsAutoTrack: true)
+        _ = try await service.commitLocal(message: "Converge spelling", authorName: "T", authorEmail: "t@example.com")
+        let after = try await service.repoInfo()
+        XCTAssertTrue(after.statusEntries.isEmpty, "must not alternate add/delete: \(after.statusEntries)")
+        XCTAssertEqual(try Data(contentsOf: repoURL.appendingPathComponent(actualPath)), image)
+    }
+
+    func testEvictedICloudFilesAreNeitherDeletionsNorNewFiles() async throws {
+        let fm = FileManager.default
+        let repoURL = fm.temporaryDirectory.appendingPathComponent("SyncMD-iCloudEviction-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: repoURL) }
+
+        var repo: OpaquePointer?
+        XCTAssertEqual(git_repository_init(&repo, repoURL.path, 0), 0)
+        if let repo { git_repository_free(repo) }
+
+        let service = LocalGitService(localURL: repoURL)
+        try "notes\n".write(to: repoURL.appendingPathComponent("Note.md"), atomically: true, encoding: .utf8)
+        try Data(repeating: 0xFF, count: 2048).write(to: repoURL.appendingPathComponent("Photo 1536.jpeg"))
+        try await service.stageAll()
+        let base = try await service.commitLocal(message: "Base", authorName: "T", authorEmail: "t@example.com")
+
+        // iCloud evicts the photo: the file vanishes and a placeholder appears.
+        try fm.removeItem(at: repoURL.appendingPathComponent("Photo 1536.jpeg"))
+        try Data("plist".utf8).write(to: repoURL.appendingPathComponent(".Photo 1536.jpeg.icloud"))
+
+        let info = try await service.repoInfo()
+        XCTAssertTrue(info.statusEntries.isEmpty, "Eviction must not show as changes: \(info.statusEntries.map(\.path))")
+
+        // Neither the per-path nor the whole-tree pass may record a deletion.
+        try await service.stageChanges(
+            [GitStatusEntry(path: "Photo 1536.jpeg", indexStatus: nil, workTreeStatus: .deleted),
+             GitStatusEntry(path: ".Photo 1536.jpeg.icloud", indexStatus: nil, workTreeStatus: .untracked)],
+            lfsAutoTrack: false
+        )
+        await XCTAssertThrowsErrorAsync(try await service.commitLocal(message: "x", authorName: "T", authorEmail: "t@example.com"))
+        try await service.stageAll(lfsAutoTrack: false)
+        if let sha = try? await service.commitLocal(message: "x", authorName: "T", authorEmail: "t@example.com") {
+            let detail = try await service.commitDetail(oid: sha)
+            XCTFail("stageAll recorded eviction noise: \(detail.changedFiles.map { "\($0.path) \($0.changeType)" })")
+        }
+        try await service.rebuildIndexFromWorkingTree(lfsAutoTrack: false)
+        if let sha = try? await service.commitLocal(message: "x", authorName: "T", authorEmail: "t@example.com") {
+            let detail = try await service.commitDetail(oid: sha)
+            XCTFail("rebuild recorded eviction noise: \(detail.changedFiles.map { "\($0.path) \($0.changeType)" })")
+        }
+
+        // A real edit alongside the eviction still commits, and the photo survives.
+        try "notes edited\n".write(to: repoURL.appendingPathComponent("Note.md"), atomically: true, encoding: .utf8)
+        try await service.rebuildIndexFromWorkingTree(lfsAutoTrack: false)
+        let next = try await service.commitLocal(message: "Edit", authorName: "T", authorEmail: "t@example.com")
+        XCTAssertNotEqual(next, base)
+        let detail = try await service.commitDetail(oid: next)
+        XCTAssertEqual(detail.changedFiles.map(\.path), ["Note.md"])
     }
 
     func testLocalGitServiceStashSaveAndApplyRoundtrip() async throws {
@@ -4681,13 +5468,15 @@ final class SyncMDTests: XCTestCase {
     func testGitLFSHydrateDownloadsPointerFilesThroughBatchAPI() async throws {
         let fm = FileManager.default
         let repoURL = fm.temporaryDirectory.appendingPathComponent("SyncMD-LFSHydrate-\(UUID().uuidString)", isDirectory: true)
-        try fm.createDirectory(at: repoURL.appendingPathComponent(".git", isDirectory: true), withIntermediateDirectories: true)
+        try fm.createDirectory(at: repoURL, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: repoURL) }
 
-        try """
-        [remote "origin"]
-            url = https://github.com/example/vault.git
-        """.write(to: repoURL.appendingPathComponent(".git/config"), atomically: true, encoding: .utf8)
+        var repository: OpaquePointer?
+        XCTAssertEqual(git_repository_init(&repository, repoURL.path, 0), 0)
+        defer { if let repository { git_repository_free(repository) } }
+        var remote: OpaquePointer?
+        XCTAssertEqual(git_remote_create(&remote, repository, "origin", "https://github.com/example/vault.git"), 0)
+        if let remote { git_remote_free(remote) }
 
         let realData = Data("actual pdf bytes\n".utf8)
         let oid = GitLFSPointer.sha256Hex(for: realData)
@@ -4696,6 +5485,11 @@ final class SyncMDTests: XCTestCase {
         try fm.createDirectory(at: docsURL, withIntermediateDirectories: true)
         let lfsFileURL = docsURL.appendingPathComponent("Manual.pdf")
         try Data(pointer.serializedString.utf8).write(to: lfsFileURL)
+        var index: OpaquePointer?
+        XCTAssertEqual(git_repository_index(&index, repository), 0)
+        XCTAssertEqual(git_index_add_bypath(index, "Docs/Manual.pdf"), 0)
+        XCTAssertEqual(git_index_write(index), 0)
+        if let index { git_index_free(index) }
 
         let transport = MockGitLFSTransport { request, body in
             if request.url?.absoluteString == "https://github.com/example/vault.git/info/lfs/objects/batch" {
@@ -4730,6 +5524,37 @@ final class SyncMDTests: XCTestCase {
 
         XCTAssertEqual(result.downloadedCount, 1)
         XCTAssertEqual(try Data(contentsOf: lfsFileURL), realData)
+    }
+
+    func testGitLFSHydrateUsesFileBackedDownloadTransport() async throws {
+        let fm = FileManager.default
+        let repoURL = fm.temporaryDirectory.appendingPathComponent("SyncMD-LFSFileDownload-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: repoURL.appendingPathComponent(".git", isDirectory: true), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: repoURL) }
+
+        try """
+        [remote "origin"]
+            url = https://github.com/example/vault.git
+        """.write(to: repoURL.appendingPathComponent(".git/config"), atomically: true, encoding: .utf8)
+
+        let realData = Data(repeating: 0x5a, count: 32 * 1024)
+        let pointer = GitLFSPointer(
+            oid: GitLFSPointer.sha256Hex(for: realData),
+            size: Int64(realData.count)
+        )
+        let fileURL = repoURL.appendingPathComponent("archive.bin")
+        try Data(pointer.serializedString.utf8).write(to: fileURL)
+
+        let transport = FileDownloadOnlyLFSTransport(pointer: pointer, payload: realData)
+        let result = try await GitLFSService(
+            localURL: repoURL,
+            credentials: .gitHubPAT("ghp_test"),
+            transport: transport
+        ).hydrateWorktree()
+
+        XCTAssertEqual(result.downloadedCount, 1)
+        XCTAssertEqual(transport.downloadCount, 1)
+        XCTAssertEqual(try Data(contentsOf: fileURL), realData)
     }
 
     func testGitLFSHydrateCanBeLimitedToChangedPaths() async throws {
@@ -5978,6 +6803,38 @@ private final class MockGitLFSTransport: GitLFSHTTPTransport, @unchecked Sendabl
     }
 }
 
+private final class FileDownloadOnlyLFSTransport: GitLFSHTTPTransport, @unchecked Sendable {
+    private let pointer: GitLFSPointer
+    private let payload: Data
+    private let lock = NSLock()
+    private var recordedDownloadCount = 0
+
+    init(pointer: GitLFSPointer, payload: Data) {
+        self.pointer = pointer
+        self.payload = payload
+    }
+
+    var downloadCount: Int { lock.withLock { recordedDownloadCount } }
+
+    func response(for request: URLRequest, body: Data?) async throws -> (Data, HTTPURLResponse) {
+        guard request.httpMethod == "POST" else {
+            throw LocalGitError.lfsFailed("LFS object download unexpectedly used the in-memory response API")
+        }
+        let data = Data("""
+        {"objects":[{"oid":"\(pointer.oid)","size":\(pointer.size),"actions":{"download":{"href":"https://objects.example.test/\(pointer.oid)"}}}]}
+        """.utf8)
+        return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+
+    func downloadResponse(for request: URLRequest) async throws -> (URL, HTTPURLResponse) {
+        lock.withLock { recordedDownloadCount += 1 }
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SyncMD-LFSDownload-\(UUID().uuidString)")
+        try payload.write(to: fileURL)
+        return (fileURL, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+    }
+}
+
 /// Records file-backed LFS uploads and deliberately rejects attempts to send
 /// upload payloads through the Data API, which would load large objects into
 /// memory on iOS.
@@ -6562,7 +7419,23 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
     var commitLocalCallCount = 0
     var pushCurrentBranchResult: Result<Void, Error>?
     var pushCurrentBranchCallCount = 0
+    var backfillLFSResult: GitLFSBackfillResult = .empty
+    var backfillLFSCallCount = 0
     var repoInfoCallCount = 0
+    var commitLocalError: Error?
+    /// One entry per commitLocal call, consumed in order; nil means succeed.
+    var commitLocalErrorQueue: [Error?] = []
+    var stageAllCallCount = 0
+    var mergeBranchError: Error?
+    var applyStashResultKind: StashApplyResultKind = .applied
+    var recoveryReferences: [String] = []
+    var hardResetReferences: [String] = []
+    /// Ordered record of the mutating and network calls, for tests that care
+    /// about which step happens before which.
+    var operationLog: [String] = []
+    var onSaveStash: ((FakeGitRepository) -> Void)?
+    var onMergeBranch: ((FakeGitRepository) -> Void)?
+    var onCompleteMerge: ((FakeGitRepository) -> Void)?
     var commitAndPushResult: Result<LocalPushResult, Error>?
     var commitAndPushMessages: [String] = []
     var executePullOnlyGate: AsyncGate?
@@ -6605,6 +7478,7 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
 
     func pullPlan(pat: String) async throws -> PullPlan {
         pullPlanCallCount += 1
+        operationLog.append("pullPlan")
         if let pullPlanError { throw pullPlanError }
         return pullPlanResult
     }
@@ -6679,12 +7553,16 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
 
     func mergeBranch(name: String, authorName: String, authorEmail: String) async throws -> MergeResult {
         mergeBranchCallCount += 1
+        operationLog.append("mergeBranch")
+        onMergeBranch?(self)
+        if let mergeBranchError { throw mergeBranchError }
         return mergeResult
     }
 
     func pushCurrentBranch(pat: String) async throws {
         didPushCurrentBranch = true
         pushCurrentBranchCallCount += 1
+        operationLog.append("pushCurrentBranch")
         if let pushCurrentBranchResult {
             switch pushCurrentBranchResult {
             case .success:
@@ -6693,6 +7571,12 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
                 throw error
             }
         }
+    }
+
+    func backfillLFSObjects(pat: String) async throws -> GitLFSBackfillResult {
+        backfillLFSCallCount += 1
+        operationLog.append("backfillLFSObjects")
+        return backfillLFSResult
     }
 
     var repairUnpushedLargeBlobsCallCount = 0
@@ -6713,7 +7597,29 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
         }
     }
 
-    func fetchRemote(pat: String) async throws {}
+    func fetchRemote(pat: String) async throws {
+        operationLog.append("fetchRemote")
+    }
+
+    func createRecoveryReference() async throws -> GitRecoverySnapshot {
+        operationLog.append("createRecoveryReference")
+        let name = "refs/vaultbridge/recovery/test-\(recoveryReferences.count + 1)"
+        recoveryReferences.append(name)
+        return GitRecoverySnapshot(referenceName: name, commitSHA: repoInfoResult.commitSHA)
+    }
+
+    func hardReset(referenceName: String) async throws -> String {
+        operationLog.append("hardReset")
+        hardResetReferences.append(referenceName)
+        repoInfoResult = LocalRepoInfo(
+            branch: repoInfoResult.branch,
+            commitSHA: "ffffffffffffffffffffffffffffffffffffffff",
+            changeCount: 0,
+            syncState: .upToDate,
+            statusEntries: []
+        )
+        return repoInfoResult.commitSHA
+    }
 
     func revertCommit(oid: String, message: String, authorName: String, authorEmail: String) async throws -> RevertResult {
         revertResult
@@ -6721,6 +7627,8 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
 
     func completeMerge(message: String, authorName: String, authorEmail: String) async throws -> MergeFinalizeResult {
         completeMergeCallCount += 1
+        operationLog.append("completeMerge")
+        onCompleteMerge?(self)
         return mergeFinalizeResult
     }
 
@@ -6764,6 +7672,9 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
 
     func commitLocal(message: String, authorName: String, authorEmail: String) async throws -> String {
         commitLocalCallCount += 1
+        operationLog.append("commitLocal")
+        if !commitLocalErrorQueue.isEmpty, let queued = commitLocalErrorQueue.removeFirst() { throw queued }
+        if let commitLocalError { throw commitLocalError }
         let commitSHA = repoInfoResult.commitSHA
         repoInfoResult = LocalRepoInfo(
             branch: repoInfoResult.branch,
@@ -6795,6 +7706,16 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
 
     func stageAll(lfsAutoTrack: Bool) async throws {
         stagedPaths.append("*")
+        stageAllCallCount += 1
+        operationLog.append("stageAll")
+        lfsAutoTrackStageFlags.append(lfsAutoTrack)
+    }
+
+    var rebuildIndexCallCount = 0
+
+    func rebuildIndexFromWorkingTree(lfsAutoTrack: Bool) async throws {
+        rebuildIndexCallCount += 1
+        operationLog.append("rebuildIndexFromWorkingTree")
         lfsAutoTrackStageFlags.append(lfsAutoTrack)
     }
 
@@ -6845,14 +7766,19 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
 
     func saveStash(message: String, authorName: String, authorEmail: String, includeUntracked: Bool) async throws -> GitStashEntry {
         savedStashes.append((message: message, includeUntracked: includeUntracked))
-        let entry = GitStashEntry(index: stashEntriesResult.count, oid: UUID().uuidString.replacingOccurrences(of: "-", with: ""), message: message)
-        stashEntriesResult.insert(entry, at: 0)
+        operationLog.append("saveStash")
+        let entry = GitStashEntry(index: 0, oid: UUID().uuidString.replacingOccurrences(of: "-", with: ""), message: message)
+        stashEntriesResult = [entry] + stashEntriesResult.map {
+            GitStashEntry(index: $0.index + 1, oid: $0.oid, message: $0.message)
+        }
+        onSaveStash?(self)
         return entry
     }
 
     func applyStash(index: Int, reinstateIndex: Bool) async throws -> StashApplyResult {
         appliedStashIndices.append(index)
-        return StashApplyResult(kind: .applied, index: index)
+        operationLog.append("applyStash")
+        return StashApplyResult(kind: applyStashResultKind, index: index)
     }
 
     func popStash(index: Int, reinstateIndex: Bool) async throws -> StashApplyResult {

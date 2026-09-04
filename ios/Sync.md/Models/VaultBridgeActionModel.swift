@@ -1,56 +1,34 @@
 import Foundation
 
-/// Plain-language action selected from repository state. Git terminology stays
-/// available as supporting text, but the primary label describes the outcome.
+/// The one button on the normal vault screen. VaultBridge runs the whole
+/// safe workflow itself (save, compare, combine, upload, verify); the button
+/// only changes when the machine cannot proceed without a human choice.
 enum VaultBridgePrimaryAction: String, Equatable, Sendable {
-    case saveOnPhone
-    case getServerUpdates
-    case uploadSavedChanges
-    case combineChanges
+    case syncNow
     case resolveConflicts
-    case checkAgain
 
-    static func choose(changeCount: Int, syncState: RepoSyncState, conflictCount: Int) -> Self {
-        if conflictCount > 0 { return .resolveConflicts }
-        if changeCount > 0 { return .saveOnPhone }
-        switch syncState {
-        case .behind: return .getServerUpdates
-        case .ahead: return .uploadSavedChanges
-        case .diverged: return .combineChanges
-        case .upToDate, .unknown: return .checkAgain
-        }
+    static func choose(conflictCount: Int) -> Self {
+        conflictCount > 0 ? .resolveConflicts : .syncNow
     }
 
     var title: String {
         switch self {
-        case .saveOnPhone: "Save on This iPhone"
-        case .getServerUpdates: "Get Server Updates"
-        case .uploadSavedChanges: "Upload Saved Changes"
-        case .combineChanges: "Combine Phone & Server Changes"
+        case .syncNow: "Sync Now"
         case .resolveConflicts: "Resolve Conflicts"
-        case .checkAgain: "Check Again"
         }
     }
 
-    var gitSubtitle: String {
+    var subtitle: String {
         switch self {
-        case .saveOnPhone: "Create a restore point on this phone. Does not upload."
-        case .getServerUpdates: "Bring newer server files onto this phone when there is no competing phone history."
-        case .uploadSavedChanges: "Send this phone’s saved restore points to the server. Never force-overwrites."
-        case .combineChanges: "Save the phone first, then safely combine both histories. Does not upload."
-        case .resolveConflicts: "For each disputed file, choose the phone copy, server copy, or an edited combination."
-        case .checkAgain: "Check phone files and refresh the known phone-versus-server state."
+        case .syncNow: "Saves this phone, brings in server changes, combines if needed, uploads, and verifies."
+        case .resolveConflicts: "Some notes changed on both sides. Choose the phone copy, the server copy, or an edited combination."
         }
     }
 
     var systemImage: String {
         switch self {
-        case .saveOnPhone: "internaldrive.fill"
-        case .getServerUpdates: "arrow.down.circle.fill"
-        case .uploadSavedChanges: "arrow.up.circle.fill"
-        case .combineChanges: "arrow.triangle.branch"
+        case .syncNow: "arrow.triangle.2.circlepath"
         case .resolveConflicts: "exclamationmark.triangle.fill"
-        case .checkAgain: "arrow.clockwise.circle.fill"
         }
     }
 }
@@ -68,5 +46,20 @@ struct GitRecoverySnapshot: Identifiable, Codable, Equatable, Sendable {
         self.referenceName = referenceName
         self.commitSHA = commitSHA
         self.stashMessage = stashMessage
+    }
+}
+
+/// Edits that were moved into a stash so a combine or replacement could run
+/// on a clean working tree, and that have not been put back yet. Persisted so
+/// they survive an app restart and are never silently forgotten.
+struct VaultBridgeShelteredEdits: Codable, Equatable, Sendable {
+    let stashMessage: String
+    let createdAt: Date
+    let reason: String
+
+    init(stashMessage: String, reason: String, createdAt: Date = Date()) {
+        self.stashMessage = stashMessage
+        self.reason = reason
+        self.createdAt = createdAt
     }
 }

@@ -5,6 +5,10 @@ enum AppReleaseNotes {
     static var all: [NoteletVersionNotes] {
         [
             .init(
+                version: "1.0.1",
+                items: version101Items
+            ),
+            .init(
                 version: "2.5.1",
                 items: version25Items
             ),
@@ -68,7 +72,7 @@ enum AppReleaseNotes {
         NoteletStorage.markCurrentVersionAsSeen()
     }
 
-    private static let availableVersions: Set<String> = ["2.5.1", "2.4.7", "2.4.5", "2.4.1"]
+    private static let availableVersions: Set<String> = ["1.0.1", "2.5.1", "2.4.7", "2.4.5", "2.4.1"]
 
     private static var currentVersion: String? {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -76,6 +80,36 @@ enum AppReleaseNotes {
 
     private static func hasNotes(for version: String) -> Bool {
         availableVersions.contains(version)
+    }
+
+    private static var version101Items: [NoteletVersionNoteItem] {
+        [
+            .list(
+                title: "Sync that explains itself",
+                rows: [
+                    .init(
+                        symbolSystemName: "arrow.triangle.2.circlepath.circle.fill",
+                        title: "One clear Sync Now workflow",
+                        description: "VaultBridge saves on this phone, checks the server, combines changes safely, uploads, and verifies the result."
+                    ),
+                    .init(
+                        symbolSystemName: "checkmark.shield.fill",
+                        title: "Proof your save is safe",
+                        description: "Local checkpoints, phone and server commit IDs, and completed actions are shown in plain language."
+                    ),
+                    .init(
+                        symbolSystemName: "photo.badge.checkmark",
+                        title: "Reliable pasted images",
+                        description: "iOS File Provider filename and status glitches no longer create endless add/delete checkpoints."
+                    ),
+                    .init(
+                        symbolSystemName: "externaldrive.connected.to.line.below.fill",
+                        title: "Git LFS support",
+                        description: "Large files are uploaded, downloaded, checked, and verified alongside the Git repository."
+                    )
+                ]
+            )
+        ]
     }
 
     private static var version25Items: [NoteletVersionNoteItem] {

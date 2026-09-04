@@ -218,16 +218,17 @@ struct VaultBridgeDashboardView: View {
 
     private func localChanges(_ id: UUID) -> String {
         let count = state.changeCounts[id] ?? 0
-        return count == 0 ? "Clean" : "\(count) changed"
+        return count == 0 ? "Saved" : "\(count) unsaved"
     }
 
     private func remoteState(_ id: UUID) -> String {
-        switch state.syncStateByRepo[id] ?? .unknown {
-        case .upToDate: "Up to date"
-        case .ahead: "Ahead"
-        case .behind: "Behind"
-        case .diverged: "Diverged"
-        case .unknown: "Checking"
+        if state.shelteredEditsByRepo[id] != nil { return "Sheltered edits" }
+        return switch state.syncStateByRepo[id] ?? .unknown {
+        case .upToDate: "Synced"
+        case .ahead: "Not uploaded"
+        case .behind: "Server has updates"
+        case .diverged: "Needs combining"
+        case .unknown: "Not checked"
         }
     }
 

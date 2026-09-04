@@ -16,6 +16,8 @@ nonisolated struct GitInspectionMetrics: Sendable {
     var reportedEntryCount = 0
     var lfsCleanSkippedCount = 0
     var spuriousRenameSkippedCount = 0
+    var evictedSkippedCount = 0
+    var spellingMismatchCount = 0
 
     var summary: String {
         func ms(_ value: TimeInterval) -> String { String(format: "%.1f ms", value * 1000) }
@@ -23,7 +25,7 @@ nonisolated struct GitInspectionMetrics: Sendable {
             + " · status-list \(ms(statusListSeconds)) · entry-filter \(ms(entryFilterSeconds))"
             + " · sync-state \(ms(syncStateSeconds))"
             + " · entries \(reportedEntryCount) of \(rawStatusEntryCount) raw"
-            + " (skipped: \(lfsCleanSkippedCount) lfs-clean, \(spuriousRenameSkippedCount) spurious-rename)"
+            + " (skipped: \(lfsCleanSkippedCount) lfs-clean, \(spuriousRenameSkippedCount) spurious-rename, \(evictedSkippedCount) evicted; \(spellingMismatchCount) spelling-mismatch)"
     }
 }
 

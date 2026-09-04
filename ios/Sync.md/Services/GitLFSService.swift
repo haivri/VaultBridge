@@ -499,6 +499,7 @@ struct GitLFSAutoTrackingPolicy: Sendable {
 protocol GitLFSHTTPTransport: AnyObject, Sendable {
     func response(for request: URLRequest, body: Data?) async throws -> (Data, HTTPURLResponse)
     func response(for request: URLRequest, uploadingFile fileURL: URL) async throws -> (Data, HTTPURLResponse)
+    func downloadResponse(for request: URLRequest) async throws -> (URL, HTTPURLResponse)
 }
 
 extension GitLFSHTTPTransport {
@@ -507,6 +508,16 @@ extension GitLFSHTTPTransport {
     /// loads a multi-gigabyte LFS object into memory.
     func response(for request: URLRequest, uploadingFile fileURL: URL) async throws -> (Data, HTTPURLResponse) {
         try await response(for: request, body: Data(contentsOf: fileURL))
+    }
+
+    /// Compatibility path for tests and custom transports. Production
+    /// URLSession overrides this and streams directly to a temporary file.
+    func downloadResponse(for request: URLRequest) async throws -> (URL, HTTPURLResponse) {
+        let (data, response) = try await response(for: request, body: nil)
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VaultBridge-LFS-\(UUID().uuidString)")
+        try data.write(to: temporaryURL, options: .atomic)
+        return (temporaryURL, response)
     }
 }
 
@@ -527,6 +538,14 @@ extension URLSession: GitLFSHTTPTransport {
 
     func response(for request: URLRequest, uploadingFile fileURL: URL) async throws -> (Data, HTTPURLResponse) {
         let tuple = try await upload(for: request, fromFile: fileURL)
+        guard let response = tuple.1 as? HTTPURLResponse else {
+            throw LocalGitError.lfsFailed(String(localized: "Git LFS server returned a non-HTTP response."))
+        }
+        return (tuple.0, response)
+    }
+
+    func downloadResponse(for request: URLRequest) async throws -> (URL, HTTPURLResponse) {
+        let tuple = try await download(for: request)
         guard let response = tuple.1 as? HTTPURLResponse else {
             throw LocalGitError.lfsFailed(String(localized: "Git LFS server returned a non-HTTP response."))
         }
@@ -715,6 +734,13 @@ struct GitLFSHydrateResult: Equatable, Sendable {
     let checkedOutCount: Int
 
     static let empty = GitLFSHydrateResult(pointerCount: 0, downloadedCount: 0, checkedOutCount: 0)
+}
+
+struct GitLFSBackfillResult: Equatable, Sendable {
+    let referencedCount: Int
+    let uploadedCount: Int
+
+    static let empty = GitLFSBackfillResult(referencedCount: 0, uploadedCount: 0)
 }
 
 final class GitLFSService: @unchecked Sendable {
@@ -1036,12 +1062,49 @@ final class GitLFSService: @unchecked Sendable {
             return result
         }
 
+        var repository: OpaquePointer?
+        defer { if let repository { git_repository_free(repository) } }
+        if git_repository_open(&repository, localURL.path) == 0 {
+            var index: OpaquePointer?
+            defer { if let index { git_index_free(index) } }
+            if git_repository_index(&index, repository) == 0 {
+                var result: [DiscoveredPointer] = []
+                var paths: Set<String> = []
+                let count = git_index_entrycount(index)
+                for offset in 0..<count {
+                    guard let entry = git_index_get_byindex(index, offset),
+                          let pathPointer = entry.pointee.path else { continue }
+                    var oid = entry.pointee.id
+                    var blob: OpaquePointer?
+                    defer { if let blob { git_blob_free(blob) } }
+                    guard git_blob_lookup(&blob, repository, &oid) == 0,
+                          let blob,
+                          git_blob_rawsize(blob) <= 2048,
+                          let raw = git_blob_rawcontent(blob),
+                          GitLFSPointer(data: Data(bytes: raw, count: Int(git_blob_rawsize(blob)))) != nil else {
+                        continue
+                    }
+                    paths.insert(String(cString: pathPointer))
+                }
+                for path in paths.sorted() {
+                    if let pointer = try pointerFileCandidate(
+                        path: path,
+                        fileURL: localURL.appendingPathComponent(path)
+                    ) {
+                        result.append(pointer)
+                    }
+                }
+                return result
+            }
+        }
+
+        // Test fixtures and partially initialized repositories may not have a
+        // readable index yet. Keep a filesystem fallback for those cases.
         guard let enumerator = fileManager.enumerator(
             at: localURL,
-            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            includingPropertiesForKeys: nil,
             options: [.skipsPackageDescendants]
         ) else { return [] }
-
         var result: [DiscoveredPointer] = []
         for case let fileURL as URL in enumerator {
             let relative = relativePath(for: fileURL)
@@ -1049,12 +1112,10 @@ final class GitLFSService: @unchecked Sendable {
                 enumerator.skipDescendants()
                 continue
             }
-
             if let pointer = try pointerFileCandidate(path: relative, fileURL: fileURL) {
                 result.append(pointer)
             }
         }
-
         return result
     }
 
@@ -1063,12 +1124,10 @@ final class GitLFSService: @unchecked Sendable {
         guard fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory),
               !isDirectory.boolValue else { return nil }
 
-        let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true,
-              let size = values.fileSize,
-              size <= 2048 else { return nil }
-
-        let data = try Data(contentsOf: fileURL)
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: 2049) ?? Data()
+        guard data.count <= 2048 else { return nil }
         guard let pointer = GitLFSPointer(data: data) else { return nil }
         return DiscoveredPointer(path: path, fileURL: fileURL, pointer: pointer)
     }
@@ -1093,14 +1152,16 @@ final class GitLFSService: @unchecked Sendable {
                     request.setValue(value, forHTTPHeaderField: key)
                 }
 
-                let (data, httpResponse) = try await transport.response(for: request, body: nil)
+                let (downloadedURL, httpResponse) = try await transport.downloadResponse(for: request)
+                defer { try? fileManager.removeItem(at: downloadedURL) }
                 try validateHTTP(httpResponse, context: "Download LFS object \(pointer.oid)")
-                guard Int64(data.count) == pointer.size,
-                      GitLFSPointer.sha256Hex(for: data) == pointer.oid else {
+                let downloaded = try GitLFSPointer.sha256HexAndSize(forFileAt: downloadedURL)
+                guard downloaded.size == pointer.size,
+                      downloaded.oid == pointer.oid else {
                     throw LocalGitError.lfsFailed(String(localized: "Downloaded LFS object \(pointer.oid) failed SHA-256/size verification."))
                 }
 
-                try storeObject(data: data, pointer: pointer)
+                try storeObject(fileAt: downloadedURL, pointer: pointer)
             }
         }
     }
@@ -1474,6 +1535,17 @@ final class GitLFSService: @unchecked Sendable {
         if fileManager.fileExists(atPath: objectURL.path) { return }
         try fileManager.createDirectory(at: objectURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: objectURL, options: .atomic)
+    }
+
+    private func storeObject(fileAt sourceURL: URL, pointer: GitLFSPointer) throws {
+        let objectURL = cachedObjectURL(for: pointer)
+        if fileManager.fileExists(atPath: objectURL.path) { return }
+        try fileManager.createDirectory(at: objectURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let stagingURL = objectURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(pointer.oid).\(UUID().uuidString).tmp")
+        defer { try? fileManager.removeItem(at: stagingURL) }
+        try fileManager.copyItem(at: sourceURL, to: stagingURL)
+        try fileManager.moveItem(at: stagingURL, to: objectURL)
     }
 
     private func relativePath(for fileURL: URL) -> String {
@@ -1908,6 +1980,25 @@ extension GitLFSService {
     /// history repair so repaired blobs land where uploads expect them.
     static func objectStorageURL(oid: String, repositoryURL: URL) -> URL {
         cachedObjectURL(oid: oid, repositoryURL: repositoryURL)
+    }
+
+    /// Short, name-free description of a path's Git LFS state, for the debug
+    /// log: whether .gitattributes tracks it, whether the index holds a
+    /// pointer, and whether the pointed-to object exists locally.
+    static func diagnosticSummary(repositoryURL: URL?, index: OpaquePointer?, path: String) -> String {
+        guard let repositoryURL else { return "lfs=unknown" }
+        let attributes = GitLFSAttributes.load(from: repositoryURL)
+        let tracked = attributes.lfsTrackingDecision(path: path)
+        let trackedText = tracked.map { $0 ? "yes" : "no" } ?? "unset"
+        var pointerText = "none"
+        var objectText = "n/a"
+        if let index, let entry = path.withCString({ git_index_get_bypath(index, $0, 0) }) {
+            pointerText = "size=\(entry.pointee.file_size)"
+            objectText = FileManager.default.fileExists(
+                atPath: repositoryURL.appendingPathComponent(path).path
+            ) ? "disk=present" : "disk=missing"
+        }
+        return "lfs-tracked=\(trackedText) index-\(pointerText) \(objectText)"
     }
 
     static func addPointer(_ pointer: GitLFSPointer, path: String, to index: OpaquePointer?) throws {

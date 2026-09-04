@@ -165,6 +165,10 @@ final class SerializedGitRepository: GitRepositoryProtocol, @unchecked Sendable 
         try await run { try await $0.pushCurrentBranch(pat: pat) }
     }
 
+    func backfillLFSObjects(pat: String) async throws -> GitLFSBackfillResult {
+        try await run { try await $0.backfillLFSObjects(pat: pat) }
+    }
+
     func repairUnpushedLargeBlobs(pat: String) async throws -> GitLFSRepairResult {
         try await run { try await $0.repairUnpushedLargeBlobs(pat: pat) }
     }
@@ -231,6 +235,10 @@ final class SerializedGitRepository: GitRepositoryProtocol, @unchecked Sendable 
 
     func stageChanges(_ entries: [GitStatusEntry], lfsAutoTrack: Bool) async throws {
         try await run { try await $0.stageChanges(entries, lfsAutoTrack: lfsAutoTrack) }
+    }
+
+    func rebuildIndexFromWorkingTree(lfsAutoTrack: Bool) async throws {
+        try await run { try await $0.rebuildIndexFromWorkingTree(lfsAutoTrack: lfsAutoTrack) }
     }
 
     func unstage(path: String, oldPath: String?) async throws {

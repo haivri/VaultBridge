@@ -25,6 +25,9 @@ protocol GitRepositoryProtocol: Sendable {
     func deleteBranch(name: String) async throws
     func mergeBranch(name: String, authorName: String, authorEmail: String) async throws -> MergeResult
     func pushCurrentBranch(pat: String) async throws
+    /// Verifies every LFS pointer in the current index and uploads any backing
+    /// objects the server is missing. Does not create or push a Git commit.
+    func backfillLFSObjects(pat: String) async throws -> GitLFSBackfillResult
     func repairUnpushedLargeBlobs(pat: String) async throws -> GitLFSRepairResult
     func revertCommit(oid: String, message: String, authorName: String, authorEmail: String) async throws -> RevertResult
     func completeMerge(message: String, authorName: String, authorEmail: String) async throws -> MergeFinalizeResult
@@ -49,6 +52,10 @@ protocol GitRepositoryProtocol: Sendable {
     /// Callers should prefer this over `stageAll` so large vaults do not need
     /// another full working-tree traversal just to create a checkpoint.
     func stageChanges(_ entries: [GitStatusEntry], lfsAutoTrack: Bool) async throws
+    /// Rebuilds the index from HEAD and the working tree: stale index entries
+    /// disappear, missing files become deletions, new files are added, and the
+    /// LFS policy is applied. The expert "Force Save" path.
+    func rebuildIndexFromWorkingTree(lfsAutoTrack: Bool) async throws
     func unstage(path: String, oldPath: String?) async throws
     func discardChanges(path: String) async throws
     func discardAllChanges() async throws
@@ -76,10 +83,18 @@ protocol GitRepositoryProtocol: Sendable {
 }
 
 extension GitRepositoryProtocol {
+    func backfillLFSObjects(pat: String) async throws -> GitLFSBackfillResult {
+        .empty
+    }
+
     func stageChanges(_ entries: [GitStatusEntry], lfsAutoTrack: Bool) async throws {
         for entry in entries {
             try await stage(path: entry.path, oldPath: entry.oldPath, lfsAutoTrack: lfsAutoTrack)
         }
+    }
+
+    func rebuildIndexFromWorkingTree(lfsAutoTrack: Bool) async throws {
+        try await stageAll(lfsAutoTrack: lfsAutoTrack)
     }
 
     func createRecoveryReference() async throws -> GitRecoverySnapshot {
