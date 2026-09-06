@@ -22,6 +22,13 @@ The setup guide includes HTTPS tokens, SSH keys, on-device vault placement,
 Git LFS, first-sync behavior, and common troubleshooting. For build-only and
 command-line signing details, see [BUILDING.md](BUILDING.md).
 
+For Obsidian on macOS, Windows, or Linux, use the
+[Vault Git Sync (Desktop) companion plugin](https://github.com/haivri/obsidian-vault-git-sync-desktop).
+It saves local edits, merges remote updates, and pushes through Git and Git LFS.
+Configure both devices with the same remote and branch, then sync before
+switching devices. The desktop plugin is available as a GitHub release and is
+not listed in the Obsidian community directory.
+
 ## Safety model
 
 The vault screen has one button, **Sync Now**. It saves this phone, checks the
