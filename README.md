@@ -23,7 +23,7 @@ Git LFS, first-sync behavior, and common troubleshooting. For build-only and
 command-line signing details, see [BUILDING.md](BUILDING.md).
 
 For Obsidian on macOS, Windows, or Linux, use the
-[Vault Git Sync (Desktop) companion plugin](https://github.com/haivri/obsidian-vault-git-sync-desktop).
+[Vault Git Sync (Desktop) companion plugin](https://github.com/haivri/obsidian-git-sync-desktop).
 It saves local edits, merges remote updates, and pushes through Git and Git LFS.
 Configure both devices with the same remote and branch, then sync before
 switching devices. The desktop plugin is available as a GitHub release and is
@@ -34,7 +34,7 @@ not listed in the Obsidian community directory.
 The vault screen has one button, **Sync Now**. It saves this phone, checks the
 server, brings server changes in (a fast-forward when only the server moved, a
 merge commit when both sides moved), uploads, and verifies. It changes only
-when a person must choose: **Resolve Conflicts**.
+when a person must choose: **Review your files**.
 
 - A merge never rewrites phone commits, so the commit ID shown as proof of a
   save stays valid. Rebase remains an explicit "Advanced" tool in the drawer.
@@ -56,6 +56,23 @@ It stops for conflicts, credentials, host trust, or recovery approval. Runs are
 journaled without filenames, URLs, credentials, or document contents. Work that
 leaves the foreground holds a background assertion whose expiration cancels the
 work cleanly and, on iOS 26, may continue as a system continued-processing task.
+
+## Saving, review, and recovery
+
+A single status card shows the next useful action. **All saved — you’re all set**
+appears only after a fresh check confirms the same commit on the phone and
+server, a clean working copy, and hydrated attachments. Offline saves remain
+local; automatic retries back off. iOS controls when background work can run.
+
+Conflicts open the actual files from the main screen. Compare phone and server
+versions, see differing Obsidian settings, choose a copy or combine edits, then
+**Save and finish syncing**. Both histories remain protected. A choice cannot
+silently overwrite edits made while its preview was open.
+
+Recently received files that disappear or revert, and unusually large deletion
+batches, pause for review. Restore the protected files or approve the exact
+changes shown. **Recover previous work** is available outside Git tools and
+restores an individual file while protecting its current bytes first.
 
 ## Requirements
 

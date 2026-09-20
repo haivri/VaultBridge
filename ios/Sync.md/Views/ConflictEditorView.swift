@@ -59,7 +59,7 @@ struct ConflictEditorView: View {
             } else if showResolved || detail == nil {
                 BEmptyState(
                     title: String(localized: "Conflict resolved"),
-                    subtitle: String(localized: "All edits for this path have been staged.")
+                    subtitle: String(localized: "Your choice is saved. Continue reviewing the remaining files.")
                 )
             } else if let detail {
                 editorBody(detail: detail)
@@ -68,7 +68,7 @@ struct ConflictEditorView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .principal) {
-                Text(String(localized: "RESOLVE CONFLICT"))
+                Text(String(localized: "Combine edits"))
                     .font(.system(size: 12, weight: .black, design: .monospaced))
                     .foregroundStyle(Color.brutalText)
                     .tracking(2)
@@ -77,7 +77,7 @@ struct ConflictEditorView: View {
                 Button {
                     showResolveConfirm = true
                 } label: {
-                    Text(String(localized: "RESOLVE"))
+                    Text(String(localized: "Save result"))
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundStyle(canResolve ? Color.brutalAccent : Color.brutalTextFaint)
                         .tracking(1)
@@ -123,7 +123,7 @@ struct ConflictEditorView: View {
                     actionButtons
                 }
 
-                if detail.ours != nil && detail.theirs != nil {
+                if detail.ours?.content != nil && detail.theirs?.content != nil && !path.hasPrefix(".obsidian/") {
                     keepBothButton(detail)
                 }
             }
@@ -284,12 +284,12 @@ struct ConflictEditorView: View {
         BCard(padding: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    Text(String(localized: "RESULT"))
+                    Text(String(localized: "Your result"))
                         .font(.system(size: 12, weight: .black, design: .monospaced))
                         .foregroundStyle(Color.brutalSuccess)
                         .tracking(1)
                     Spacer()
-                    Text(String(localized: "this is what gets staged"))
+                    Text(String(localized: "Review what will be saved"))
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(Color.brutalTextMid)
                 }
@@ -313,7 +313,7 @@ struct ConflictEditorView: View {
             Button {
                 resultText = oursText
             } label: {
-                Text(String(localized: "KEEP PHONE VERSION"))
+                Text(String(localized: "Start with iPhone version"))
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .tracking(1)
                     .foregroundStyle(Color.brutalAccent)
@@ -326,7 +326,7 @@ struct ConflictEditorView: View {
             Button {
                 resultText = theirsText
             } label: {
-                Text(String(localized: "KEEP SERVER VERSION"))
+                Text(String(localized: "Start with server version"))
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .tracking(1)
                     .foregroundStyle(Color.brutalWarning)
@@ -349,7 +349,7 @@ struct ConflictEditorView: View {
                 if ok { dismiss() }
             }
         } label: {
-            Label("KEEP BOTH AS SEPARATE FILES", systemImage: "doc.on.doc")
+            Label("Keep both copies", systemImage: "doc.on.doc")
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
                 .tracking(1)
                 .foregroundStyle(Color.brutalSuccess)
@@ -436,9 +436,9 @@ struct ConflictEditorView: View {
             repoID: repoID,
             path: keepPath,
             content: data,
-            additionalPathsToRemove: extras
+            additionalPathsToRemove: extras, expected: detail
         )
 
-        dismiss()
+        if state.conflictSessionByRepo[repoID]?.unmergedPaths.contains(path) != true { dismiss() }
     }
 }

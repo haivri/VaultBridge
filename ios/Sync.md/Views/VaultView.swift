@@ -7,8 +7,12 @@ struct VaultView: View {
     let repoID: UUID
 
     @State private var showSettings = false
+    @State private var showReview = false
+    @State private var showProof = false
+    @State private var showSafetyReview = false
+    @State private var showRecovery = false
     @State private var showCommitSheet = false
-    @State private var showChangedFiles = true
+    @State private var showChangedFiles = false
     @State private var showGitTools = false
     @State private var showReplaceConfirmation = false
     @State private var showSafeMergeConfirmation = false
@@ -75,6 +79,9 @@ struct VaultView: View {
             }
         }
         .sheet(isPresented: $showCommitSheet) { GitControlSheet(repoID: repoID) }
+        .sheet(isPresented: $showRecovery) { NavigationStack { FileRecoveryView(repoID: repoID) } }
+        .sheet(isPresented: $showSafetyReview) { NavigationStack { SafetyReviewView(repoID: repoID) } }
+        .sheet(isPresented: $showReview) { NavigationStack { ConflictReviewView(repoID: repoID) } }
         .sheet(isPresented: $showSettings) { VaultBridgeRepoSettingsView(repoID: repoID) }
         .navigationDestination(for: DiffDestination.self) { dest in
             FileDiffView(repoID: dest.repoID, path: dest.path)
@@ -148,6 +155,14 @@ struct VaultView: View {
             // still request fresh status immediately.
             state.detectChanges(repoID: repoID, skipIfRecentlyStartedWithin: 60)
         }
+        .task {
+            if VaultBridgeNotificationRouter.shared.repoID == repoID {
+                await state.loadConflictSession(repoID: repoID)
+                if conflictedFileCount > 0 { showReview = true }
+                else if state.safetyReviewByRepo[repoID] != nil { showSafetyReview = true }
+                VaultBridgeNotificationRouter.shared.repoID = nil
+            }
+        }
         .onChange(of: state.repos) {
             if state.repo(id: repoID) == nil { dismiss() }
         }
@@ -159,7 +174,6 @@ struct VaultView: View {
     private func clonedContent(_ repo: RepoConfig) -> some View {
         ScrollView {
             VStack(spacing: 12) {
-                statusHeroCard(repo)
                 if repo.assist.enabled || repo.assist.health.kind != .never {
                     assistHealthCard(repo.assist.health)
                 }
@@ -170,6 +184,8 @@ struct VaultView: View {
                 if !statusEntries.isEmpty {
                     changedFilesCard
                 }
+                Button("Recover previous work", systemImage: "clock.arrow.circlepath") { showRecovery = true }
+                    .disabled(isBusy)
                 gitToolsSection
 
                 if let result = callbackResult {
@@ -352,86 +368,50 @@ struct VaultView: View {
 
     // MARK: - Sync Card
 
-    private var conflictedFileCount: Int { statusEntries.filter(\.isConflicted).count }
+    private var conflictedFileCount: Int {
+        state.conflictSessionByRepo[repoID]?.unmergedPaths.count ?? statusEntries.filter(\.isConflicted).count
+    }
 
     private var primaryAction: VaultBridgePrimaryAction {
         .choose(conflictCount: conflictedFileCount)
     }
 
     private var syncCard: some View {
-        BCard(padding: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(localSafetyTitle)
-                        .font(.system(size: 16, weight: .bold))
-                    Text(localSafetyDetail)
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundStyle(Color.brutalTextMid)
-                        .textSelection(.enabled)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
-
+        BCard {
+            VStack(alignment: .leading, spacing: 16) {
+                Label(localSafetyTitle, systemImage: conflictedFileCount > 0 ? "doc.badge.ellipsis" : verifiedComplete ? "checkmark.circle.fill" : "arrow.triangle.2.circlepath")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(verifiedComplete ? Color.brutalSuccess : .primary)
+                    .accessibilityIdentifier("vault.saveStatus")
                 if isBusy {
-                    BDivider()
-                    HStack(spacing: 12) {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(Color.brutalAccent)
-                        Text(progressText.uppercased())
-                            .font(.system(size: 13, weight: .medium, design: .monospaced))
-                            .foregroundStyle(Color.brutalText)
-                            .tracking(1)
-                            .lineLimit(2)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                } else if let result = lastResult {
-                    BDivider()
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: result.kind.systemImage)
-                            .font(.system(size: 13))
-                            .foregroundStyle(toneColor(result.kind.tone))
-                        Text(result.message)
-                            .font(.system(size: 13, design: .monospaced))
-                            .foregroundStyle(Color.brutalText)
-                            .textSelection(.enabled)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                } else if coordinatorStatus.phase != .idle {
-                    BDivider()
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: coordinatorStatus.phase == .complete ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                            .font(.system(size: 13))
-                            .foregroundStyle(coordinatorStatus.phase == .complete ? Color.brutalSuccess : Color.brutalWarning)
-                        Text(coordinatorStatus.message)
-                            .font(.system(size: 13, design: .monospaced))
-                            .foregroundStyle(Color.brutalText)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
+                    HStack { ProgressView(); Text(progressText) }
+                } else {
+                    Text(statusExplanation).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
-
-                BDivider()
-
                 Button { performPrimaryAction() } label: {
-                    BActionRow(
-                        icon: primaryAction.systemImage,
-                        title: primaryAction.title,
-                        subtitle: primaryAction.subtitle,
-                        badge: primaryAction == .resolveConflicts ? conflictedFileCount : nil,
-                        badgeStyle: .error
-                    )
+                    Label(state.safetyReviewByRepo[repoID] != nil ? "Review unexpected changes" : conflictedFileCount > 0 ? "Review \(conflictedFileCount) file\(conflictedFileCount == 1 ? "" : "s")" : "Sync now", systemImage: primaryAction.systemImage)
+                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
                 .disabled(isBusy)
-                .opacity(isBusy ? 0.5 : 1)
+                .accessibilityIdentifier("vault.nextAction")
+                DisclosureGroup("Git details", isExpanded: $showProof) {
+                    Text(localSafetyDetail).font(.caption.monospaced()).textSelection(.enabled)
+                }.font(.subheadline)
             }
         }
+    }
+
+    private var verifiedComplete: Bool {
+        coordinatorStatus.phase == .complete && changeCount == 0 && conflictedFileCount == 0 && shelteredEdits == nil && syncState == .upToDate
+    }
+    private var statusExplanation: String {
+        if conflictedFileCount > 0 { return "Both originals are protected. Choose the result you want to keep." }
+        if verifiedComplete { return "This iPhone and the server match. Checked \(relativeAge(coordinatorStatus.date) ?? "just now")." }
+        if changeCount > 0 { return "Your files are on this iPhone. New edits are waiting to be saved and uploaded." }
+        if coordinatorStatus.message != "Ready" { return coordinatorStatus.message }
+        return "VaultBridge checks for updates and saves your work when it can run. Last server check: \(relativeAge(repo?.gitState.lastRemoteCheckDate) ?? "not checked yet")."
     }
 
     private var progressText: String {
@@ -451,19 +431,15 @@ struct VaultView: View {
     }
 
     private var localSafetyTitle: String {
-        if conflictedFileCount > 0 {
-            return conflictedFileCount == 1
-                ? "1 note needs your choice"
-                : "\(conflictedFileCount) notes need your choice"
-        }
-        if changeCount > 0 { return "\(changeCount) change\(changeCount == 1 ? "" : "s") not saved yet" }
-        switch syncState {
-        case .ahead: return "Saved on this iPhone, not uploaded yet"
-        case .upToDate: return "Saved on this iPhone and on the server"
-        case .behind: return "Saved on this iPhone. The server has newer notes"
-        case .diverged: return "Saved on this iPhone. The server also has new notes"
-        case .unknown: return "Saved on this iPhone"
-        }
+        if conflictedFileCount > 0 { return "\(conflictedFileCount) file\(conflictedFileCount == 1 ? "" : "s") need\(conflictedFileCount == 1 ? "s" : "") your choice" }
+        if isBusy { return "Saving your work" }
+        if verifiedComplete { return "All saved — you’re all set" }
+        if changeCount > 0 { return "New edits are waiting to sync" }
+        if shelteredEdits != nil { return "Some protected edits need to be put back" }
+        if coordinatorStatus.phase == .attention || coordinatorStatus.phase == .failed { return "Saved work is protected. Sync needs attention" }
+        if syncState == .ahead { return "Saved here. Waiting to upload" }
+        if syncState == .behind || syncState == .diverged { return "Updates are ready to combine" }
+        return "Checking your saved work"
     }
 
     private var localSafetyDetail: String {
@@ -476,17 +452,24 @@ struct VaultView: View {
 
     private func relativeAge(_ date: Date?) -> String? {
         guard let date else { return nil }
+        if abs(date.timeIntervalSinceNow) < 60 { return "just now" }
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .full
         return formatter.localizedString(for: date, relativeTo: Date())
     }
 
     private func performPrimaryAction() {
+        if state.safetyReviewByRepo[repoID] != nil { showSafetyReview = true; return }
         switch primaryAction {
         case .syncNow:
-            Task { await syncCoordinator.sync(repoID: repoID, using: state) }
+            Task {
+                await syncCoordinator.sync(repoID: repoID, using: state)
+                if state.safetyReviewByRepo[repoID] != nil { showSafetyReview = true }
+                else if conflictedFileCount > 0 { showReview = true }
+                else if verifiedComplete { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+            }
         case .resolveConflicts:
-            showCommitSheet = true
+            showReview = true
         }
     }
 
@@ -606,27 +589,27 @@ struct VaultView: View {
             DisclosureGroup(isExpanded: $showGitTools) {
                 VStack(spacing: 0) {
                     BDivider()
-                    gitToolButton("Save on This iPhone Only", subtitle: "Creates a restore point here and shows its ID. Does not upload.", icon: "internaldrive") {
+                    gitToolButton("Commit", subtitle: "Creates a restore point here and shows its ID. Does not upload.", icon: "internaldrive") {
                         saveLocally()
                     }
                     BDivider()
-                    gitToolButton("Bring Newer Server Notes Here", subtitle: "Only when this phone has nothing unsaved and no competing work. Does not upload.", icon: "arrow.down") {
+                    gitToolButton("Pull", subtitle: "Only when this phone has nothing unsaved and no competing work. Does not upload.", icon: "arrow.down") {
                         Task { _ = await state.pullOnly(repoID: repoID, showsProgressDelay: false) }
                     }
                     BDivider()
-                    gitToolButton("Upload This iPhone's Saved Work", subtitle: "Checks the server first, then sends saved work. Never overwrites server work.", icon: "arrow.up") {
+                    gitToolButton("Push", subtitle: "Checks the server first, then sends saved work. Never overwrites server work.", icon: "arrow.up") {
                         Task { await state.pushCurrentBranch(repoID: repoID) }
                     }
                     BDivider()
-                    gitToolButton("Combine Phone and Server Here", subtitle: "Saves this phone, shelters notes still being written, and combines both histories. Does not upload.", icon: "arrow.triangle.merge") {
+                    gitToolButton("Merge", subtitle: "Saves this phone, shelters notes still being written, and combines both histories. Does not upload.", icon: "arrow.triangle.merge") {
                         showSafeMergeConfirmation = true
                     }
                     BDivider()
-                    gitToolButton("Advanced: Put Phone Work After Server Work", subtitle: "Rebase. Rewrites only unuploaded phone commits so they follow the server's. The phone commit ID changes.", icon: "arrow.triangle.2.circlepath") {
+                    gitToolButton("Rebase", subtitle: "Rebase. Rewrites only unuploaded phone commits so they follow the server's. The phone commit ID changes.", icon: "arrow.triangle.2.circlepath") {
                         Task { await state.pullWithRebase(repoID: repoID, showsProgressDelay: false) }
                     }
                     BDivider()
-                    gitToolButton("Expert Git Tools", subtitle: "History, branches, stashes, tags, revert, and conflict tools.", icon: "wrench.and.screwdriver") {
+                    gitToolButton("More Git tools", subtitle: "History, branches, stashes, tags, revert, and conflict tools.", icon: "wrench.and.screwdriver") {
                         showCommitSheet = true
                     }
                     if let recovery = state.recoveryByRepo[repoID] {

@@ -995,7 +995,7 @@ final class SyncMDTests: XCTestCase {
         await coordinator.sync(repoID: fixture.repoConfig.id, using: state)
 
         XCTAssertEqual(coordinator.status(for: fixture.repoConfig.id).phase, .complete)
-        XCTAssertEqual(coordinator.status(for: fixture.repoConfig.id).message, "Combined and uploaded")
+        XCTAssertEqual(coordinator.status(for: fixture.repoConfig.id).message, "All saved — you’re all set. This iPhone and the server match.")
         XCTAssertEqual(fixture.repository.mergeBranchCallCount, 1)
         XCTAssertEqual(fixture.repository.pullRebaseCallCount, 0, "The automatic workflow never rewrites phone commits")
         XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 1)
@@ -1916,7 +1916,7 @@ final class SyncMDTests: XCTestCase {
 
         await coordinator.syncAll(using: state, automatic: true)
 
-        XCTAssertEqual(coordinator.status(for: repo.id).phase, .complete)
+        XCTAssertEqual(coordinator.status(for: repo.id).phase, .idle)
         XCTAssertEqual(fixture.repository.repoInfoCallCount, 1)
         XCTAssertTrue(fixture.repository.stagedPaths.isEmpty)
         XCTAssertEqual(fixture.repository.pullPlanCallCount, 0)
@@ -4988,6 +4988,120 @@ final class SyncMDTests: XCTestCase {
         XCTAssertFalse(repoInfo.statusEntries.contains(where: { $0.path == "README.md" && $0.isConflicted }))
     }
 
+    @MainActor
+    func testAutomaticAuthenticationFailureNeedsActionWithoutRetryLoop() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.pullPlanError = LocalGitError.authenticationFailed("Sign in again")
+        let state = AppState(gitRepositoryFactory: { _ in fixture.repository }, loadPersistedState: false)
+        state.repos = [fixture.repoConfig]
+        let coordinator = VaultBridgeSyncCoordinator()
+        await coordinator.sync(repoID: fixture.repoConfig.id, using: state)
+        XCTAssertEqual(coordinator.status(for: fixture.repoConfig.id).phase, .attention)
+        XCTAssertFalse(coordinator.status(for: fixture.repoConfig.id).retrySuggested)
+    }
+
+    @MainActor
+    func testGuidedSettingsReviewSavesAndVerifies() async throws {
+        let state = AppState(loadPersistedState: false)
+        try await SyncSafetyUIFixture.prepare(state)
+        let repo = try XCTUnwrap(state.repos.first)
+        let loaded = await state.loadConflictDetail(repoID: repo.id, path: ".obsidian/app.json")
+        let detail = try XCTUnwrap(loaded)
+        await state.resolveConflictFile(repoID: repo.id, path: detail.lookupPath, strategy: .theirs, expected: detail)
+        let coordinator = VaultBridgeSyncCoordinator()
+        await coordinator.sync(repoID: repo.id, using: state)
+        XCTAssertEqual(coordinator.status(for: repo.id).phase, .complete, coordinator.status(for: repo.id).message + " " + (state.lastError ?? ""))
+    }
+
+    func testLargeDeletionBatchRequiresExactApproval() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("DeletionSafety-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var raw: OpaquePointer?; XCTAssertEqual(git_repository_init(&raw, root.path, 0), 0); git_repository_free(raw)
+        let service = LocalGitService(localURL: root)
+        for index in 0..<6 { try Data("saved\n".utf8).write(to: root.appendingPathComponent("\(index).md")) }
+        try await service.stageAll()
+        _ = try await commitLocalFixtureChanges(using: service, message: "Saved files")
+        for index in 0..<5 { try FileManager.default.removeItem(at: root.appendingPathComponent("\(index).md")) }
+        var review: SyncSafetyReview?
+        do { try await service.stageAll(); XCTFail("Deletion batch should stop") }
+        catch LocalGitError.suspiciousChanges(let value) { review = value }
+        let decision = try XCTUnwrap(review)
+        XCTAssertEqual(decision.paths.count, 5)
+        try await service.reviewSafetyChanges(approve: false, review: decision)
+        for index in 0..<6 { XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("\(index).md"), encoding: .utf8), "saved\n") }
+        try await service.stageAll()
+        let clean = try await service.repoInfo()
+        XCTAssertEqual(clean.changeCount, 0)
+        for index in 0..<5 { try FileManager.default.removeItem(at: root.appendingPathComponent("\(index).md")) }
+        try await service.reviewSafetyChanges(approve: true, review: decision)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("5.md"))
+        do { try await service.stageAll(); XCTFail("Old approval must not cover a different deletion set") }
+        catch LocalGitError.suspiciousChanges(let current) {
+            XCTAssertEqual(current.paths.count, 6)
+            try await service.reviewSafetyChanges(approve: true, review: current)
+        }
+        try await service.stageAll()
+        _ = try await commitLocalFixtureChanges(using: service, message: "Approved deletions")
+    }
+
+    @MainActor
+    func testCoordinatorDoesNotClaimSavedWhenFreshVerificationDisagrees() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.repoInfoResult = LocalRepoInfo(branch: "main", commitSHA: String(repeating: "1", count: 40), changeCount: 0, syncState: .behind, remoteCommitSHA: String(repeating: "2", count: 40))
+        let state = AppState(gitRepositoryFactory: { _ in fixture.repository }, loadPersistedState: false)
+        state.repos = [fixture.repoConfig]
+        let coordinator = VaultBridgeSyncCoordinator()
+        await coordinator.sync(repoID: fixture.repoConfig.id, using: state)
+        XCTAssertNotEqual(coordinator.status(for: fixture.repoConfig.id).phase, .complete)
+    }
+
+    func testConflictResolutionMaterializesIncomingNotesBeforeNextSave() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("MergeSafety-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var raw: OpaquePointer?
+        XCTAssertEqual(git_repository_init(&raw, root.path, 0), 0)
+        git_repository_free(raw)
+        let service = LocalGitService(localURL: root)
+        func write(_ name: String, _ value: String) throws {
+            try value.write(to: root.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        try write("settings.json", "{\"choice\":\"base\"}\n")
+        try write("Existing.md", "original\n")
+        try await service.stageAll()
+        _ = try await commitLocalFixtureChanges(using: service, message: "Base")
+        let branch = try await service.repoInfo().branch
+        try await service.createBranch(name: "server")
+        try await service.switchBranch(name: "server")
+        try write("settings.json", "{\"choice\":\"server\"}\n")
+        try write("Today.md", "Afternoon journal entry\n")
+        try write("Existing.md", "Updated on desktop\n")
+        try await service.stageAll()
+        _ = try await commitLocalFixtureChanges(using: service, message: "Server notes")
+        try await service.switchBranch(name: branch)
+        try write("settings.json", "{\"choice\":\"phone\"}\n")
+        try await service.stageAll()
+        _ = try await commitLocalFixtureChanges(using: service, message: "Phone settings")
+        do {
+            _ = try await service.mergeBranch(name: "server", authorName: "Test", authorEmail: "test@example.invalid")
+            XCTFail("Expected settings conflict")
+        } catch LocalGitError.mergeConflictsDetected { }
+        // This is the incident: unrelated incoming content must already be on disk.
+        XCTAssertEqual(try? String(contentsOf: root.appendingPathComponent("Today.md"), encoding: .utf8), "Afternoon journal entry\n")
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("Existing.md"), encoding: .utf8), "Updated on desktop\n")
+        try await service.resolveConflict(path: "settings.json", strategy: .theirs)
+        _ = try await service.completeMerge(message: "Choose server settings", authorName: "Test", authorEmail: "test@example.invalid")
+        let before = try await service.repoInfo()
+        XCTAssertEqual(before.changeCount, 0, "Incoming changes must not appear as phone deletions or reversions")
+        try await service.stageAll()
+        let after = try await service.repoInfo()
+        XCTAssertEqual(after.changeCount, 0)
+        XCTAssertEqual(before.commitSHA, after.commitSHA)
+    }
+
     func testLocalGitServiceCompleteMergeCreatesCommitAndCleansState() async throws {
         let fm = FileManager.default
         let repoURL = fm.temporaryDirectory.appendingPathComponent("SyncMD-CompleteMerge-\(UUID().uuidString)", isDirectory: true)
@@ -7566,11 +7680,14 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
         if let pushCurrentBranchResult {
             switch pushCurrentBranchResult {
             case .success:
-                return
+                break
             case .failure(let error):
                 throw error
             }
         }
+        repoInfoResult = LocalRepoInfo(branch: repoInfoResult.branch, commitSHA: repoInfoResult.commitSHA,
+            changeCount: repoInfoResult.changeCount, syncState: .upToDate,
+            statusEntries: repoInfoResult.statusEntries, remoteCommitSHA: repoInfoResult.commitSHA)
     }
 
     func backfillLFSObjects(pat: String) async throws -> GitLFSBackfillResult {

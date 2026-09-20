@@ -3,7 +3,7 @@ import Network
 import UIKit
 
 struct BackgroundSyncConditions: Sendable, Equatable { let isWiFi: Bool; let isExternalPower: Bool }
-protocol BackgroundSyncConditionsProviding: Sendable { func current() async -> BackgroundSyncConditions }
+nonisolated protocol BackgroundSyncConditionsProviding: Sendable { func current() async -> BackgroundSyncConditions }
 struct PermissiveBackgroundSyncConditions: BackgroundSyncConditionsProviding {
     func current() async -> BackgroundSyncConditions { .init(isWiFi: true, isExternalPower: true) }
 }

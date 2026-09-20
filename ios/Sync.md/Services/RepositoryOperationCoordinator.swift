@@ -317,6 +317,18 @@ final class SerializedGitRepository: GitRepositoryProtocol, @unchecked Sendable 
         try await run { try await $0.commitDetail(oid: oid) }
     }
 
+    func restoreFile(path: String, from commit: String) async throws {
+        try await run { try await $0.restoreFile(path: path, from: commit) }
+    }
+
+    func reviewSafetyChanges(approve: Bool, review: SyncSafetyReview) async throws {
+        try await run { try await $0.reviewSafetyChanges(approve: approve, review: review) }
+    }
+
+    func verifySync(pat: String) async throws -> LocalRepoInfo {
+        try await run { try await $0.verifySync(pat: pat) }
+    }
+
     func repoInfo() async throws -> LocalRepoInfo { try await run { try await $0.repoInfo() } }
 
     func createRecoveryReference() async throws -> GitRecoverySnapshot {

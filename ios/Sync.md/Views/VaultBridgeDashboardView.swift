@@ -5,13 +5,16 @@ struct VaultBridgeDashboardView: View {
     @Environment(VaultBridgeSyncCoordinator.self) private var syncCoordinator
 
     @State private var showAddRepo = false
+    @State private var navigation: [UUID] = []
+    @AppStorage("lastOpenedVault") private var lastOpenedVault = ""
+    @State private var restoredNavigation = false
     @State private var settingsRepoID: UUID?
     @State private var lfsRepairRepoID: UUID?
 
     var body: some View {
         @Bindable var state = state
 
-        NavigationStack {
+        NavigationStack(path: $navigation) {
             ZStack {
                 Color(.systemGroupedBackground).ignoresSafeArea()
 
@@ -21,7 +24,7 @@ struct VaultBridgeDashboardView: View {
                     ScrollView {
                         LazyVStack(spacing: 14) {
                             overview
-                            ForEach(state.repos) { repo in
+                            ForEach(state.repos.sorted { attentionCount($0.id) > attentionCount($1.id) }) { repo in
                                 vaultCard(repo)
                             }
                         }
@@ -74,7 +77,21 @@ struct VaultBridgeDashboardView: View {
             } message: {
                 Text("Unpushed commits containing large files will be rewritten so those files use Git LFS. Commit messages, authors, and every file are preserved, a backup ref keeps the current state recoverable, and nothing already on the remote is changed. The vault then pushes normally.")
             }
+            .onChange(of: VaultBridgeNotificationRouter.shared.repoID) {
+                if let id = VaultBridgeNotificationRouter.shared.repoID, state.repo(id: id) != nil { navigation = [id] }
+            }
+            .onChange(of: state.repos.count) {
+                if navigation.isEmpty && state.repos.count == 1, let only = state.repos.first { navigation = [only.id] }
+            }
+            .onChange(of: navigation) {
+                if let selected = navigation.last { lastOpenedVault = selected.uuidString }
+            }
             .task {
+                if !restoredNavigation {
+                    restoredNavigation = true
+                    if state.repos.count == 1, let only = state.repos.first { navigation = [only.id] }
+                    else if let selected = UUID(uuidString: lastOpenedVault), state.repo(id: selected) != nil { navigation = [selected] }
+                }
                 await syncCoordinator.syncOnForeground(using: state)
             }
         }
@@ -83,7 +100,7 @@ struct VaultBridgeDashboardView: View {
     private var overview: some View {
         HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("AUTOMATIC GIT FOR YOUR VAULTS")
+                Text("Your saved work")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Text(summaryText)
@@ -126,8 +143,8 @@ struct VaultBridgeDashboardView: View {
                     Text(repo.displayName)
                         .font(.headline)
                         .lineLimit(1)
-                    Text(repo.gitState.branch.isEmpty ? repo.branch : repo.gitState.branch)
-                        .font(.caption.monospaced())
+                    Text(repo.autoSyncEnabled ? "Automatic sync enabled" : "Manual sync")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -159,17 +176,10 @@ struct VaultBridgeDashboardView: View {
                 }
             }
 
-            HStack(spacing: 8) {
-                statusPill(title: localChanges(repo.id), systemImage: "doc.badge.ellipsis")
-                statusPill(title: remoteState(repo.id), systemImage: "arrow.up.arrow.down")
-                if !repo.autoSyncEnabled {
-                    statusPill(title: "Manual", systemImage: "hand.raised")
-                }
-            }
 
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(syncStatus.message)
+                    Text(attentionCount(repo.id) > 0 ? "Files need your choice" : syncStatus.message)
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(statusColor(syncStatus.phase))
                         .lineLimit(2)
@@ -181,17 +191,8 @@ struct VaultBridgeDashboardView: View {
                 if syncStatus.isRunning {
                     ProgressView().controlSize(.small)
                 }
-                Button {
-                    Task { await syncCoordinator.sync(repoID: repo.id, using: state) }
-                } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                }
-                .buttonStyle(.bordered)
-                .buttonBorderShape(.circle)
-                .disabled(syncCoordinator.isSyncingAll || state.isSyncing || syncStatus.isRunning)
-                .accessibilityLabel("Sync \(repo.displayName)")
                 NavigationLink(value: repo.id) {
-                    Text("Open")
+                    Text(attentionCount(repo.id) > 0 ? "Review" : "View vault")
                 }
                 .buttonStyle(.bordered)
             }
@@ -213,12 +214,17 @@ struct VaultBridgeDashboardView: View {
 
     private var summaryText: String {
         let automatic = state.repos.filter(\.autoSyncEnabled).count
-        return "\(state.repos.count) vault\(state.repos.count == 1 ? "" : "s") · \(automatic) automatic"
+        let attention = state.repos.filter { attentionCount($0.id) > 0 }.count
+        return attention > 0 ? "\(attention) vault\(attention == 1 ? " needs" : "s need") your attention" : "\(state.repos.count) vault\(state.repos.count == 1 ? "" : "s") · \(automatic) automatic"
+    }
+
+    private func attentionCount(_ id: UUID) -> Int {
+        (state.conflictSessionByRepo[id]?.unmergedPaths.count ?? 0) + (state.safetyReviewByRepo[id]?.paths.count ?? 0)
     }
 
     private func localChanges(_ id: UUID) -> String {
         let count = state.changeCounts[id] ?? 0
-        return count == 0 ? "Saved" : "\(count) unsaved"
+        return count == 0 ? "Checkpoint saved" : "\(count) changes to sync"
     }
 
     private func remoteState(_ id: UUID) -> String {

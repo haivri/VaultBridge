@@ -2,7 +2,7 @@ import Foundation
 import Observation
 import StoreKit
 
-struct PremiumFinishableTransaction: Sendable {
+nonisolated struct PremiumFinishableTransaction: Sendable {
     let value: PremiumVerifiedTransaction
     private let finishOperation: @Sendable () async -> Void
 
@@ -14,7 +14,7 @@ struct PremiumFinishableTransaction: Sendable {
     func finish() async { await finishOperation() }
 }
 
-protocol PremiumStorefront: Sendable {
+nonisolated protocol PremiumStorefront: Sendable {
     func setAppAccountToken(_ token: UUID) async
     func products(identifiers: [String]) async throws -> [PremiumProduct]
     /// StoreKit's verified current-entitlement sequence is authoritative,
@@ -71,7 +71,7 @@ actor StoreKitPremiumStorefront: PremiumStorefront {
 
     func sync() async throws { try await AppStore.sync() }
 
-    func transactionUpdates() -> AsyncStream<PremiumFinishableTransaction> {
+    nonisolated func transactionUpdates() -> AsyncStream<PremiumFinishableTransaction> {
         AsyncStream { continuation in
             let task = Task {
                 for await result in Transaction.updates {

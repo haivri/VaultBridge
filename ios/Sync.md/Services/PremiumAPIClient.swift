@@ -12,7 +12,7 @@ struct PremiumAPIConfiguration: Sendable, Equatable {
     init(baseURL: URL?) { self.baseURL = baseURL }
 }
 
-protocol PremiumHTTPTransport: Sendable { func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) }
+nonisolated protocol PremiumHTTPTransport: Sendable { func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) }
 struct URLSessionPremiumHTTPTransport: PremiumHTTPTransport {
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let (data, response) = try await URLSession.shared.data(for: request)

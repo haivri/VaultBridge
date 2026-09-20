@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Clibgit2
 import libgit2
 import os
@@ -6,6 +7,7 @@ import os
 // MARK: - Errors
 
 enum LocalGitError: LocalizedError {
+    case suspiciousChanges(SyncSafetyReview)
     case notCloned
     case invalidRemoteURL
     case cloneFailed(String)
@@ -46,8 +48,19 @@ enum LocalGitError: LocalizedError {
     case sshHostKeyTrustRequired(GitLFSSSHHostKeyTrustError)
     case libgit2(String)
 
+    var requiresUserAction: Bool {
+        switch self {
+        case .authenticationFailed, .sshHostKeyTrustRequired, .invalidAuthorIdentity,
+             .repositoryCorrupted, .suspiciousChanges, .conflictSessionInProgress,
+             .lfsLargeBlobsNotTracked, .lfsRepairBlocked, .invalidRemoteURL: true
+        default: false
+        }
+    }
+
     var errorDescription: String? {
         switch self {
+        case .suspiciousChanges(let review):
+            return "\(review.paths.count) unexpected file changes need your review. Previous versions are protected; nothing has been uploaded."
         case .notCloned:
             return String(localized: "Repository not cloned yet. Clone it first.")
         case .invalidRemoteURL:
@@ -1187,6 +1200,7 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                 context: "Queue branch ref update"
             )
             try git2Check(git_transaction_commit(refTransaction), context: "Commit branch ref update")
+            try Self.recordReceivedFiles(repo: repo, before: &expectedLocalOid, after: remoteOidPtr)
 
             return (result: LocalPullResult(updated: true, newCommitSHA: oidToHex(&remoteOidCopy)), changedPaths: changedPaths)
         }.value
@@ -2192,86 +2206,62 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             }
 
             if analysis.rawValue & GIT_MERGE_ANALYSIS_FASTFORWARD.rawValue != 0 {
-                try git2Check(
-                    git_reset(repo, sourceCommit, GIT_RESET_HARD, nil),
-                    context: "Fast-forward merge"
-                )
-
-                return MergeResult(
-                    kind: .fastForwarded,
-                    sourceBranch: branchName,
-                    newCommitSHA: oidToHex(sourceOid)
-                )
+                // Use the same guarded checkout as a pull, never a hard reset.
+                var options = git_checkout_options()
+                git_checkout_options_init(&options, UInt32(GIT_CHECKOUT_OPTIONS_VERSION))
+                options.checkout_strategy = GIT_CHECKOUT_SAFE.rawValue
+                if try Self.hasUncommittedChanges(repo: repo) { throw LocalGitError.mergeBlockedByLocalChanges }
+                guard let refName = git_reference_name(headRef).map({ String(cString: $0) }) else { throw LocalGitError.mergeBlockedByLocalChanges }
+                var transaction: OpaquePointer?
+                defer { if let transaction { git_transaction_free(transaction) } }
+                try git2Check(git_transaction_new(&transaction, repo), context: "Protect merge branch")
+                try git2Check(git_transaction_lock_ref(transaction, "HEAD"), context: "Lock merge HEAD")
+                if refName != "HEAD" { try git2Check(git_transaction_lock_ref(transaction, refName), context: "Lock merge branch") }
+                var current = git_oid()
+                try git2Check(git_reference_name_to_id(&current, repo, "HEAD"), context: "Recheck merge HEAD")
+                guard git_oid_equal(&current, headOid) != 0 else { throw LocalGitError.mergeBlockedByLocalChanges }
+                try git2Check(git_checkout_tree(repo, sourceCommit, &options), context: "Safely receive merged files")
+                var tree: OpaquePointer?; var index: OpaquePointer?
+                defer { if let tree { git_tree_free(tree) }; if let index { git_index_free(index) } }
+                try git2Check(git_commit_tree(&tree, sourceCommit), context: "Read merged tree")
+                try git2Check(git_repository_index(&index, repo), context: "Open merged index")
+                try git2Check(git_index_read_tree(index, tree), context: "Record merged files")
+                try git2Check(git_index_write(index), context: "Save merged index")
+                try git2Check(git_transaction_set_target(transaction, refName, sourceOid, nil, "merge: fast-forward"), context: "Advance merged branch")
+                try git2Check(git_transaction_commit(transaction), context: "Save merged branch")
+                try Self.recordReceivedFiles(repo: repo, before: headOid, after: sourceOid)
+                return MergeResult(kind: .fastForwarded, sourceBranch: branchName, newCommitSHA: oidToHex(sourceOid))
+            }
+            guard analysis.rawValue & GIT_MERGE_ANALYSIS_NORMAL.rawValue != 0 else {
+                throw LocalGitError.libgit2("The histories cannot be combined safely.")
             }
 
-            if analysis.rawValue & GIT_MERGE_ANALYSIS_NORMAL.rawValue == 0 {
-                throw LocalGitError.libgit2(String(localized: "Merge analysis did not produce a supported strategy"))
+            // Keep both parents reachable even if another operation later aborts.
+            var protectedRef: OpaquePointer?
+            defer { if let protectedRef { git_reference_free(protectedRef) } }
+            let recoveryName = "refs/vaultbridge/recovery/merge-" + UUID().uuidString
+            try git2Check(git_reference_create(&protectedRef, repo, recoveryName, headOid, 0, "Before combine"), context: "Protect local history")
+            var remoteRecovery: OpaquePointer?
+            defer { if let remoteRecovery { git_reference_free(remoteRecovery) } }
+            try git2Check(git_reference_create(&remoteRecovery, repo, recoveryName + "-incoming", sourceOid, 0, "Incoming history"), context: "Protect incoming history")
+
+            // libgit2 applies non-conflicting entries AND persists merge state.
+            // The previous in-memory index shortcut returned on conflicts before
+            // checkout, making incoming notes look deleted on the next save.
+            var mergeOptions = git_merge_options()
+            git_merge_options_init(&mergeOptions, UInt32(GIT_MERGE_OPTIONS_VERSION))
+            mergeOptions.flags = UInt32(GIT_MERGE_FIND_RENAMES.rawValue)
+            var checkout = git_checkout_options()
+            git_checkout_options_init(&checkout, UInt32(GIT_CHECKOUT_OPTIONS_VERSION))
+            checkout.checkout_strategy = GIT_CHECKOUT_SAFE.rawValue | GIT_CHECKOUT_ALLOW_CONFLICTS.rawValue
+            if try Self.hasUncommittedChanges(repo: repo) { throw LocalGitError.mergeBlockedByLocalChanges }
+            try theirHeads.withUnsafeMutableBufferPointer { buffer in
+                try git2Check(git_merge(repo, buffer.baseAddress, 1, &mergeOptions, &checkout), context: "Safely combine files")
             }
-
-            // Compute the merge in-memory rather than calling git_merge.
-            // git_merge runs an internal "would be overwritten" check that
-            // diffs workdir against the merge result with no NFC/NFD
-            // tolerance — on APFS that triggers false GIT_EINDEXDIRTY
-            // failures even when status is clean. git_merge_commits skips
-            // the workdir entirely and returns just the merged index, so
-            // we can take it from here ourselves.
-            var mergeOpts = git_merge_options()
-            git_merge_options_init(&mergeOpts, UInt32(GIT_MERGE_OPTIONS_VERSION))
-            mergeOpts.flags = UInt32(GIT_MERGE_FIND_RENAMES.rawValue)
-
-            var mergedIndex: OpaquePointer?
-            defer { if let mergedIndex { git_index_free(mergedIndex) } }
-            try git2Check(
-                git_merge_commits(&mergedIndex, repo, headCommit, sourceCommit, &mergeOpts),
-                context: "Compute merge index"
-            )
-
-            // Open the repo's working index so we can replace its contents
-            // with whatever git_merge_commits produced, conflicts or not.
             var index: OpaquePointer?
             defer { if let index { git_index_free(index) } }
-            try git2Check(git_repository_index(&index, repo), context: "Open repo index")
-            try git2Check(git_index_clear(index), context: "Clear repo index")
-
-            let entryCount = git_index_entrycount(mergedIndex)
-            for i in 0..<entryCount {
-                if let entry = git_index_get_byindex(mergedIndex, i) {
-                    try git2Check(git_index_add(index, entry), context: "Copy merge entry")
-                }
-            }
-            try git2Check(git_index_write(index), context: "Write merge index")
-
-            if git_index_has_conflicts(index) == 1 {
-                // Manually mark the repo as in-merge so libgit2 reports
-                // GIT_REPOSITORY_STATE_MERGE and our conflict UI activates.
-                let gitDir = repoPath + "/.git"
-                let mergeHeadFile = gitDir + "/MERGE_HEAD"
-                let mergeMsgFile = gitDir + "/MERGE_MSG"
-                let sourceHex = oidToHex(sourceOid)
-                try? (sourceHex + "\n").write(
-                    toFile: mergeHeadFile,
-                    atomically: true,
-                    encoding: .utf8
-                )
-                try? "Merge branch '\(branchName)'\n".write(
-                    toFile: mergeMsgFile,
-                    atomically: true,
-                    encoding: .utf8
-                )
-                throw LocalGitError.mergeConflictsDetected
-            }
-
-            // Clean merge — push the merged tree out to the worktree and
-            // record the merge commit. FORCE checkout is appropriate here
-            // because hasUncommittedChanges already returned false, and
-            // FORCE leaves untracked files alone.
-            var checkoutOpts = git_checkout_options()
-            git_checkout_options_init(&checkoutOpts, UInt32(GIT_CHECKOUT_OPTIONS_VERSION))
-            checkoutOpts.checkout_strategy = GIT_CHECKOUT_FORCE.rawValue
-            try git2Check(
-                git_checkout_index(repo, index, &checkoutOpts),
-                context: "Checkout merged index"
-            )
+            try git2Check(git_repository_index(&index, repo), context: "Read merged index")
+            if git_index_has_conflicts(index) != 0 { throw LocalGitError.mergeConflictsDetected }
 
             var treeOid = git_oid()
             try git2Check(git_index_write_tree(&treeOid, index), context: "Write merge tree")
@@ -2306,6 +2296,7 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                 )
             }
 
+            try Self.recordReceivedFiles(repo: repo, before: headOid, after: &mergeCommitOid)
             try git2Check(git_repository_state_cleanup(repo), context: "Cleanup merge state")
 
             return MergeResult(
@@ -2436,6 +2427,13 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                 throw LocalGitError.mergeConflictsDetected
             }
 
+            let pendingWrites = try Self.statusEntries(repo: repo).filter {
+                $0.workTreeStatus != nil && $0.workTreeStatus != .untracked
+            }
+            guard pendingWrites.isEmpty else {
+                throw LocalGitError.repositoryCorrupted("Some files changed while combining versions. Your saved versions are protected. Review the changed files before finishing; nothing has been uploaded.")
+            }
+
             var headRef: OpaquePointer?
             defer { if let headRef { git_reference_free(headRef) } }
             try git2Check(git_repository_head(&headRef, repo), context: "Read HEAD")
@@ -2490,6 +2488,7 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                 )
             }
 
+            try Self.recordReceivedFiles(repo: repo, before: headOid, after: &commitOid)
             try git2Check(git_repository_state_cleanup(repo), context: "Cleanup merge state")
 
             return MergeFinalizeResult(newCommitSHA: oidToHex(&commitOid))
@@ -2712,6 +2711,17 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             }
             try git2Check(conflictLookupCode, context: "Lookup conflict entry for \(trimmedPath)")
 
+            try Self.backupWorkingFile(trimmedPath, repo: repo)
+            if strategy != .manual && (strategy == .ours ? ours : theirs) == nil {
+                let file = try Self.guardedFile(trimmedPath, repo: repo)
+                if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+                try git2Check(git_index_conflict_remove(index, conflictPath), context: "Record chosen deletion")
+                let remove = git_index_remove_bypath(index, conflictPath)
+                if remove != GIT_ENOTFOUND.rawValue { try git2Check(remove, context: "Stage chosen deletion") }
+                try git2Check(git_index_write(index), context: "Save conflict choice")
+                return
+            }
+
             if strategy != .manual {
                 let storage = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: 1)
                 defer { storage.deallocate() }
@@ -2798,7 +2808,8 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                     lookupPath: lookupPath,
                     ancestor: ancestor,
                     ours: ours,
-                    theirs: theirs
+                    theirs: theirs,
+                    workingCopyFingerprint: try Self.workingFingerprint(lookupPath, repo: repo)
                 )
             }
 
@@ -2830,6 +2841,12 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             var index: OpaquePointer?
             defer { if let index { git_index_free(index) } }
             try git2Check(git_repository_index(&index, repo), context: "Read index")
+
+            _ = try Self.guardedFile(trimmedPath, repo: repo)
+            if trimmedPath.lowercased().hasSuffix(".json") {
+                _ = try JSONSerialization.jsonObject(with: content, options: [.fragmentsAllowed])
+            }
+            for name in [trimmedPath] + extras { try Self.backupWorkingFile(name, repo: repo) }
 
             // Write the resolved bytes to the working tree, creating any missing
             // parent directories. The kept path may not exist on disk yet (e.g.
@@ -3131,6 +3148,8 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             defer { if let repo { git_repository_free(repo) } }
             try git2Check(git_repository_open(&repo, repoPath), context: "Open repo")
 
+            try Self.guardSuspiciousChanges(repo: repo)
+
             var index: OpaquePointer?
             defer { if let index { git_index_free(index) } }
             try git2Check(git_repository_index(&index, repo), context: "Get index")
@@ -3175,6 +3194,8 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             defer { if let repo { git_repository_free(repo) } }
             try git2Check(git_repository_open(&repo, repoPath), context: "Open repo")
             Self.setPrecomposeUnicode(repo: repo)
+
+            try Self.guardSuspiciousChanges(repo: repo)
 
             var index: OpaquePointer?
             defer { if let index { git_index_free(index) } }
@@ -3229,6 +3250,8 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             var repo: OpaquePointer?
             defer { if let repo { git_repository_free(repo) } }
             try git2Check(git_repository_open(&repo, repoPath), context: "Open repo")
+
+            try Self.guardSuspiciousChanges(repo: repo)
 
             var index: OpaquePointer?
             defer { if let index { git_index_free(index) } }
@@ -4310,6 +4333,16 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
         }.value
     }
 
+    func verifySync(pat: String) async throws -> LocalRepoInfo {
+        // Hydration validates object size and digest; commit equality alone does
+        // not prove that usable attachments exist in the working folder.
+        _ = try await Self.hydrateLFSIfNeeded(localURL: localURL, pat: pat)
+        try await fetchRemote(pat: pat)
+        let session = try await conflictSession()
+        guard !session.isActive else { throw LocalGitError.conflictSessionInProgress(session.kind) }
+        return try await repoInfo()
+    }
+
     // MARK: - History
 
     func commitHistory(limit: Int, skip: Int) async throws -> [GitCommitSummary] {
@@ -4539,7 +4572,7 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                     remoteCommitSHA = oidToHex(remoteTarget)
                 }
 
-                let entries = (try? Self.statusEntries(repo: repo, profile: profile)) ?? []
+                let entries = try Self.statusEntries(repo: repo, profile: profile)
                 let changeCount = entries.count
                 let syncState = GitInspectionProfiler.measure("syncState", into: &profile.metrics.syncStateSeconds) {
                     Self.syncState(repo: repo, head: head)
@@ -5355,10 +5388,11 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
         var upstreamRef: OpaquePointer?
         defer { if let upstreamRef { git_reference_free(upstreamRef) } }
 
-        let upstreamCode = git_branch_upstream(&upstreamRef, head)
-        if upstreamCode != 0 {
-            return .unknown
-        }
+        // Sync uses origin/current-branch even when a newly created branch has
+        // no upstream configuration. Compare the same destination everywhere.
+        guard let branch = git_reference_shorthand(head).map({ String(cString: $0) }) else { return .unknown }
+        let upstreamCode = git_reference_lookup(&upstreamRef, repo, "refs/remotes/origin/\(branch)")
+        if upstreamCode != 0 { return .unknown }
 
         guard let upstreamRef, let upstreamOID = git_reference_target(upstreamRef) else {
             return .unknown
@@ -5543,4 +5577,167 @@ nonisolated private func skipICloudEvictionCallback(
     if ICloudEviction.isPlaceholder(path: relativePath) { return 1 }
     let context = Unmanaged<EvictionCallbackContext>.fromOpaque(payload).takeUnretainedValue()
     return ICloudEviction.isEvicted(path: relativePath, in: context.workdirURL) ? 1 : 0
+}
+
+// Recovery manifests are private repository metadata, never diagnostic journals.
+extension LocalGitService {
+    private struct ReceivedFile: Codable { let path: String; let expected: String; let previous: String? }
+    private struct SafetyManifest: Codable { var incoming: [ReceivedFile] = []; var approved: String? }
+
+    private static func safetyURL(repo: OpaquePointer?) throws -> URL {
+        guard let directory = git_repository_path(repo) else { throw LocalGitError.notCloned }
+        let folder = URL(fileURLWithPath: String(cString: directory)).appendingPathComponent("vaultbridge-safety")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder.appendingPathComponent("received.json")
+    }
+    private static func readSafety(repo: OpaquePointer?) throws -> SafetyManifest {
+        let url = try safetyURL(repo: repo)
+        guard FileManager.default.fileExists(atPath: url.path) else { return SafetyManifest() }
+        return try JSONDecoder().decode(SafetyManifest.self, from: Data(contentsOf: url))
+    }
+    private static func writeSafety(_ manifest: SafetyManifest, repo: OpaquePointer?) throws {
+        try JSONEncoder().encode(manifest).write(to: safetyURL(repo: repo), options: .atomic)
+    }
+    private static func blobID(repo: OpaquePointer?, commitOID: UnsafePointer<git_oid>, path: String) throws -> String? {
+        var commit: OpaquePointer?; defer { if let commit { git_commit_free(commit) } }
+        try git2Check(git_commit_lookup(&commit, repo, commitOID), context: "Read saved version")
+        var tree: OpaquePointer?; defer { if let tree { git_tree_free(tree) } }
+        try git2Check(git_commit_tree(&tree, commit), context: "Read saved files")
+        var entry: OpaquePointer?; defer { if let entry { git_tree_entry_free(entry) } }
+        let code = git_tree_entry_bypath(&entry, tree, path)
+        if code == GIT_ENOTFOUND.rawValue { return nil }
+        try git2Check(code, context: "Read saved file")
+        return oidToHex(git_tree_entry_id(entry))
+    }
+    private static func recordReceivedFiles(repo: OpaquePointer?, before: UnsafePointer<git_oid>, after: UnsafePointer<git_oid>) throws {
+        let paths = try changedPathsBetween(repo: repo, oldOID: before, newOID: after)
+        var manifest = try readSafety(repo: repo)
+        // A no-op sync must not erase protection of recently received files.
+        guard !paths.isEmpty else { return }
+        manifest.incoming = try paths.compactMap { path in
+            guard let expected = try blobID(repo: repo, commitOID: after, path: path) else { return nil }
+            return ReceivedFile(path: path, expected: expected, previous: try blobID(repo: repo, commitOID: before, path: path))
+        }
+        manifest.approved = nil
+        try writeSafety(manifest, repo: repo)
+    }
+    private static func guardedFile(_ path: String, repo: OpaquePointer?) throws -> URL {
+        guard let workdir = git_repository_workdir(repo), !path.hasPrefix("/"),
+              !path.split(separator: "/").contains(where: { $0 == ".." || $0.lowercased() == ".git" }) else {
+            throw LocalGitError.repositoryCorrupted("This file path cannot be changed safely.")
+        }
+        let root = URL(fileURLWithPath: String(cString: workdir)).standardizedFileURL.resolvingSymlinksInPath()
+        let file = root.appendingPathComponent(path).standardizedFileURL
+        var component = root
+        for part in path.split(separator: "/") {
+            component.appendPathComponent(String(part))
+            if (try? component.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                throw LocalGitError.repositoryCorrupted("A file uses a symbolic link. Review it before continuing.")
+            }
+        }
+        guard file.resolvingSymlinksInPath().path.hasPrefix(root.path + "/") else {
+            throw LocalGitError.repositoryCorrupted("A file points outside this vault. Review it before continuing.")
+        }
+        return file
+    }
+    private static func assessLosses(repo: OpaquePointer?) throws -> SyncSafetyReview? {
+        let entries = try statusEntries(repo: repo)
+        let deleted = entries.filter { !$0.isConflicted && $0.oldPath == nil && ($0.workTreeStatus == .deleted || $0.indexStatus == .deleted) }
+        var index: OpaquePointer?; defer { if let index { git_index_free(index) } }
+        try git2Check(git_repository_index(&index, repo), context: "Check saved files")
+        let total = max(1, Int(git_index_entrycount(index)))
+        var paths = Set<String>()
+        if deleted.count >= 20 || (deleted.count >= 5 && Double(deleted.count) / Double(total) >= 0.2) { paths.formUnion(deleted.map(\.path)) }
+        let manifest = try readSafety(repo: repo)
+        for received in manifest.incoming {
+            guard let change = entries.first(where: { $0.path == received.path }), change.oldPath == nil else { continue }
+            if change.workTreeStatus == .deleted || change.indexStatus == .deleted { paths.insert(received.path); continue }
+            if let previous = received.previous, previous != received.expected {
+                let file = try guardedFile(received.path, repo: repo)
+                if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 1_048_576,
+                   let data = try? Data(contentsOf: file) {
+                    var oid = git_oid()
+                    try data.withUnsafeBytes { bytes in try git2Check(git_odb_hash(&oid, bytes.baseAddress, data.count, GIT_OBJECT_BLOB), context: "Check file contents") }
+                    if oidToHex(&oid) == previous { paths.insert(received.path) }
+                }
+            }
+        }
+        guard !paths.isEmpty else { return nil }
+        var head = git_oid(); try git2Check(git_reference_name_to_id(&head, repo, "HEAD"), context: "Read recovery version")
+        var signature = oidToHex(&head)
+        for path in paths.sorted() {
+            signature += "\n" + path
+            if let data = try? Data(contentsOf: guardedFile(path, repo: repo)) { signature += SHA256.hash(data: data).description }
+            else { signature += "missing" }
+        }
+        let fingerprint = SHA256.hash(data: Data(signature.utf8)).description
+        guard manifest.approved != fingerprint else { return nil }
+        return SyncSafetyReview(paths: paths.sorted(), fingerprint: fingerprint)
+    }
+    private static func guardSuspiciousChanges(repo: OpaquePointer?) throws {
+        if let review = try assessLosses(repo: repo) { throw LocalGitError.suspiciousChanges(review) }
+    }
+    func reviewSafetyChanges(approve: Bool, review: SyncSafetyReview) async throws {
+        let location = localURL
+        try await Task.detached {
+            var repo: OpaquePointer?; defer { if let repo { git_repository_free(repo) } }
+            try git2Check(git_repository_open(&repo, location.path), context: "Open recovery")
+            guard try Self.assessLosses(repo: repo) == review else { throw LocalGitError.repositoryCorrupted("The files changed. Review their latest versions first.") }
+            var manifest = try Self.readSafety(repo: repo)
+            if approve { manifest.approved = review.fingerprint; try Self.writeSafety(manifest, repo: repo); return }
+            var head = git_oid(); try git2Check(git_reference_name_to_id(&head, repo, "HEAD"), context: "Read protected version")
+            var restoredIndex: OpaquePointer?
+            defer { if let restoredIndex { git_index_free(restoredIndex) } }
+            try git2Check(git_repository_index(&restoredIndex, repo), context: "Open restored file index")
+            for path in review.paths {
+                let file = try Self.guardedFile(path, repo: repo)
+                let identifier = try manifest.incoming.first(where: { $0.path == path })?.expected ?? Self.blobID(repo: repo, commitOID: &head, path: path)
+                guard let identifier else { continue }
+                var oid = git_oid(); try git2Check(git_oid_fromstr(&oid, identifier), context: "Read protected file ID")
+                var blob: OpaquePointer?; defer { if let blob { git_blob_free(blob) } }
+                try git2Check(git_blob_lookup(&blob, repo, &oid), context: "Read protected file")
+                try Self.backupWorkingFile(path, repo: repo)
+                let bytes = Data(bytes: git_blob_rawcontent(blob), count: Int(git_blob_rawsize(blob)))
+                try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try bytes.write(to: file, options: .atomic)
+                try git2Check(git_index_add_bypath(restoredIndex, path), context: "Record restored file")
+            }
+            try git2Check(git_index_write(restoredIndex), context: "Save restored file index")
+        }.value
+    }
+    func restoreFile(path: String, from commit: String) async throws {
+        let root = localURL
+        try await Task.detached {
+            var repo: OpaquePointer?; defer { if let repo { git_repository_free(repo) } }
+            try git2Check(git_repository_open(&repo, root.path), context: "Open file recovery")
+            guard git_repository_state(repo) == 0 else { throw LocalGitError.repositoryCorrupted("Finish reviewing the current combine before restoring another version.") }
+            var oid = git_oid(); try git2Check(git_oid_fromstr(&oid, commit), context: "Read selected checkpoint")
+            guard let identifier = try Self.blobID(repo: repo, commitOID: &oid, path: path) else { throw LocalGitError.repositoryCorrupted("This file does not exist in the selected checkpoint.") }
+            var blobOID = git_oid(); try git2Check(git_oid_fromstr(&blobOID, identifier), context: "Read saved file ID")
+            var blob: OpaquePointer?; defer { if let blob { git_blob_free(blob) } }
+            try git2Check(git_blob_lookup(&blob, repo, &blobOID), context: "Read saved file")
+            let file = try Self.guardedFile(path, repo: repo)
+            try Self.backupWorkingFile(path, repo: repo)
+            let bytes = Data(bytes: git_blob_rawcontent(blob), count: Int(git_blob_rawsize(blob)))
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try bytes.write(to: file, options: .atomic)
+            var manifest = try Self.readSafety(repo: repo)
+            manifest.incoming.removeAll { $0.path == path }
+            try Self.writeSafety(manifest, repo: repo)
+        }.value
+    }
+
+    private static func workingFingerprint(_ path: String, repo: OpaquePointer?) throws -> String {
+        let file = try guardedFile(path, repo: repo)
+        guard FileManager.default.fileExists(atPath: file.path) else { return "missing" }
+        return SHA256.hash(data: try Data(contentsOf: file)).description
+    }
+    private static func backupWorkingFile(_ path: String, repo: OpaquePointer?) throws {
+        let file = try guardedFile(path, repo: repo)
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        let folder = try safetyURL(repo: repo).deletingLastPathComponent().appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: file, to: folder.appendingPathComponent("content"))
+        try Data(path.utf8).write(to: folder.appendingPathComponent("source"), options: .atomic)
+    }
 }

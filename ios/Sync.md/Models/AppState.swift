@@ -169,8 +169,10 @@ final class AppState {
     var syncStateByRepo: [UUID: RepoSyncState] = [:]
     var pullOutcomeByRepo: [UUID: PullOutcomeState] = [:]
     var pushErrorByRepo: [UUID: PushErrorState] = [:]
+    var syncNeedsUserActionByRepo: [UUID: Bool] = [:]
     var diffByRepo: [UUID: UnifiedDiffResult] = [:]
     var branchesByRepo: [UUID: BranchInventory] = [:]
+    var safetyReviewByRepo: [UUID: SyncSafetyReview] = [:]
     var conflictSessionByRepo: [UUID: ConflictSession] = [:]
     var commitHistoryByRepo: [UUID: [GitCommitSummary]] = [:]
     var commitHistoryHasMoreByRepo: [UUID: Bool] = [:]
@@ -1247,20 +1249,18 @@ final class AppState {
         }
     }
 
-    func resolveConflictFile(repoID: UUID, path: String, strategy: ConflictResolutionStrategy) async {
-        guard let repo = repo(id: repoID), repo.isCloned else { return }
-        if isDemoMode { return }
-
-        let vaultDir = vaultURL(for: repoID)
-        let gitService = gitRepositoryFactory(vaultDir)
-
-        guard gitService.hasGitDirectory else {
-            showError(message: LocalGitError.notCloned.localizedDescription)
-            return
-        }
-
+    func resolveConflictFile(repoID: UUID, path: String, strategy: ConflictResolutionStrategy, expected: ConflictFileDetail? = nil) async {
+        guard let repo = repo(id: repoID), repo.isCloned, !isDemoMode else { return }
+        isSyncing = true; syncingRepoID = repoID
+        defer { isSyncing = false; syncingRepoID = nil }
         do {
-            try await gitService.resolveConflict(path: path, strategy: strategy)
+            let serialized = try serializedRepository(repoID: repoID)
+            try await serialized.withLease { repository in
+                if let expected, try await repository.conflictDetail(path: path) != expected {
+                    throw LocalGitError.repositoryCorrupted("This file changed while you were reviewing it. Review the latest versions before choosing.")
+                }
+                try await repository.resolveConflict(path: path, strategy: strategy)
+            }
             detectChanges(repoID: repoID)
             await loadConflictSession(repoID: repoID)
         } catch {
@@ -1287,28 +1287,20 @@ final class AppState {
     }
 
     func resolveConflictWithContent(
-        repoID: UUID,
-        path: String,
-        content: Data,
-        additionalPathsToRemove: [String] = []
+        repoID: UUID, path: String, content: Data,
+        additionalPathsToRemove: [String] = [], expected: ConflictFileDetail? = nil
     ) async {
-        guard let repo = repo(id: repoID), repo.isCloned else { return }
-        if isDemoMode { return }
-
-        let vaultDir = vaultURL(for: repoID)
-        let gitService = gitRepositoryFactory(vaultDir)
-
-        guard gitService.hasGitDirectory else {
-            showError(message: LocalGitError.notCloned.localizedDescription)
-            return
-        }
-
+        guard let repo = repo(id: repoID), repo.isCloned, !isDemoMode else { return }
+        isSyncing = true; syncingRepoID = repoID
+        defer { isSyncing = false; syncingRepoID = nil }
         do {
-            try await gitService.resolveConflictWithContent(
-                path: path,
-                content: content,
-                additionalPathsToRemove: additionalPathsToRemove
-            )
+            let serialized = try serializedRepository(repoID: repoID)
+            try await serialized.withLease { repository in
+                if let expected, try await repository.conflictDetail(path: expected.lookupPath) != expected {
+                    throw LocalGitError.repositoryCorrupted("This file changed while you were editing the result. Review the latest versions first.")
+                }
+                try await repository.resolveConflictWithContent(path: path, content: content, additionalPathsToRemove: additionalPathsToRemove)
+            }
             detectChanges(repoID: repoID)
             await loadConflictSession(repoID: repoID)
         } catch {
@@ -1325,20 +1317,21 @@ final class AppState {
     ) async -> Bool {
         guard repo(id: repoID)?.isCloned == true,
               let phone = detail.ours,
-              let server = detail.theirs else { return false }
+              let server = detail.theirs,
+              let phoneContent = phone.content, let serverContent = server.content else { return false }
+        isSyncing = true; syncingRepoID = repoID
+        defer { isSyncing = false; syncingRepoID = nil }
+        let copyDestination = vaultURL(for: repoID).appendingPathComponent(serverCopyPath)
         do {
             let serialized = try serializedRepository(repoID: repoID)
             try await serialized.withLease { repository in
+                guard try await repository.conflictDetail(path: detail.lookupPath) == detail else { throw LocalGitError.repositoryCorrupted("This file changed. Review the latest versions first.") }
                 let primaryPath = phone.path
+                guard !FileManager.default.fileExists(atPath: copyDestination.path) else { throw LocalGitError.repositoryCorrupted("That copy already exists. Choose another filename.") }
+                try await repository.resolveConflictWithContent(path: serverCopyPath, content: serverContent, additionalPathsToRemove: [])
                 try await repository.resolveConflictWithContent(
-                    path: primaryPath,
-                    content: phone.content ?? Data(),
+                    path: primaryPath, content: phoneContent,
                     additionalPathsToRemove: detail.allPaths.filter { $0 != primaryPath }
-                )
-                try await repository.resolveConflictWithContent(
-                    path: serverCopyPath,
-                    content: server.content ?? Data(),
-                    additionalPathsToRemove: []
                 )
             }
             detectChanges(repoID: repoID)
@@ -3202,6 +3195,7 @@ final class AppState {
             return true
         }
         pullOutcomeByRepo.removeValue(forKey: repoID)
+        syncNeedsUserActionByRepo[repoID] = false
         let credentials = authPayload(for: repo)
         let authorName = repo.authorName.trimmingCharacters(in: .whitespacesAndNewlines)
         let authorEmail = repo.authorEmail.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3315,11 +3309,13 @@ final class AppState {
             setPullOutcome(repoID: repoID, kind: .cancelled, message: String(localized: "Sync was cancelled"))
             return false
         } catch {
+            syncNeedsUserActionByRepo[repoID] = (error as? LocalGitError)?.requiresUserAction == true
+            if case LocalGitError.sshHostKeyTrustRequired = error { _ = handleSSHHostKeyTrustIfNeeded(error, repoID: repoID, operation: .pull) }
             setPullOutcome(repoID: repoID, kind: .failed, message: error.localizedDescription)
             if presentsErrors {
                 showError(message: error.localizedDescription, category: "merge")
             } else {
-                DebugLogger.shared.error("merge", error.localizedDescription)
+                DebugLogger.shared.error("merge", "Automatic combine could not finish; review the vault status.")
             }
             return false
         }
@@ -3435,6 +3431,7 @@ final class AppState {
         syncingRepoID = repoID
         syncProgress = String(localized: "Uploading saved changes…")
         pushErrorByRepo.removeValue(forKey: repoID)
+        syncNeedsUserActionByRepo[repoID] = false
         defer { isSyncing = false; syncingRepoID = nil }
 
         do {
@@ -3505,6 +3502,7 @@ final class AppState {
             setPullOutcome(repoID: repoID, kind: .cancelled, message: String(localized: "Upload cancelled"))
             return false
         } catch {
+            syncNeedsUserActionByRepo[repoID] = (error as? LocalGitError)?.requiresUserAction == true
             let isLFSRepairEligible: Bool
             if case LocalGitError.lfsLargeBlobsNotTracked = error {
                 isLFSRepairEligible = true
@@ -3525,7 +3523,7 @@ final class AppState {
                 if presentsErrors {
                     showError(message: message, category: "push")
                 } else {
-                    DebugLogger.shared.error("push", message)
+                    DebugLogger.shared.error("push", "Automatic upload could not finish; review the vault status.")
                 }
             }
             return false

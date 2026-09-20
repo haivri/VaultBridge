@@ -41,6 +41,7 @@ struct ConflictFileDetail: Sendable, Equatable {
     let ancestor: ConflictFileSide?
     let ours: ConflictFileSide?
     let theirs: ConflictFileSide?
+    var workingCopyFingerprint: String? = nil
 
     /// Both sides exist with different paths — same ancestor file renamed two ways.
     var isRenameRename: Bool {

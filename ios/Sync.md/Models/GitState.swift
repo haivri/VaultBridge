@@ -12,6 +12,8 @@ struct GitState: Codable, Equatable {
     var remoteCommitSHA: String? = nil
     var lastRemoteCheckDate: Date? = nil
     var localCheckpointDate: Date? = nil
+    var verifiedCommitSHA: String? = nil
+    var lastVerifiedDate: Date? = nil
 
     static let empty = GitState(
         commitSHA: "",

@@ -77,12 +77,18 @@ protocol GitRepositoryProtocol: Sendable {
     func fetchRemote(pat: String) async throws
     func commitHistory(limit: Int, skip: Int) async throws -> [GitCommitSummary]
     func commitDetail(oid: String) async throws -> GitCommitDetail
+    func restoreFile(path: String, from commit: String) async throws
+    func reviewSafetyChanges(approve: Bool, review: SyncSafetyReview) async throws
+    func verifySync(pat: String) async throws -> LocalRepoInfo
     func repoInfo() async throws -> LocalRepoInfo
     func createRecoveryReference() async throws -> GitRecoverySnapshot
     func hardReset(referenceName: String) async throws -> String
 }
 
 extension GitRepositoryProtocol {
+    func restoreFile(path: String, from commit: String) async throws { throw LocalGitError.repositoryCorrupted("File recovery is unavailable for this repository.") }
+    func reviewSafetyChanges(approve: Bool, review: SyncSafetyReview) async throws { throw LocalGitError.repositoryCorrupted("Recovery is unavailable for this repository.") }
+    func verifySync(pat: String) async throws -> LocalRepoInfo { try await repoInfo() }
     func backfillLFSObjects(pat: String) async throws -> GitLFSBackfillResult {
         .empty
     }

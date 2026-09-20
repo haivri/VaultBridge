@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import UserNotifications
 
 enum VaultBridgeLocalNotifications {
@@ -23,6 +24,7 @@ enum VaultBridgeLocalNotifications {
         content.body = needsAttention
             ? "Open VaultBridge to review \(repo.displayName)."
             : "\(repo.displayName) is safely up to date."
+        content.userInfo = ["vaultID": repo.id.uuidString]
         content.sound = .default
         let identifier = "vaultbridge.sync.\(repo.id.uuidString)"
         center.removePendingNotificationRequests(withIdentifiers: [identifier])
@@ -49,6 +51,7 @@ struct VaultBridgeSyncStatus: Equatable, Sendable {
     var phase: VaultBridgeSyncPhase = .idle
     var message: String = "Ready"
     var date: Date?
+    var retrySuggested = false
 
     var isRunning: Bool {
         switch phase {
@@ -151,6 +154,8 @@ final class VaultBridgeSyncCoordinator {
     private(set) var statusByRepo: [UUID: VaultBridgeSyncStatus] = [:]
     private(set) var isSyncingAll = false
     private var lastForegroundSync: Date?
+    private var retryTasks: [UUID: Task<Void, Never>] = [:]
+    private var retryCounts: [UUID: Int] = [:]
     private var runIDByRepo: [UUID: UUID] = [:]
     private var runModeByRepo: [UUID: String] = [:]
     private var checkpointSHAByRepo: [UUID: String] = [:]
@@ -217,6 +222,10 @@ final class VaultBridgeSyncCoordinator {
               let repo = state.repo(id: repoID),
               repo.isCloned else { return }
 
+        retryTasks[repoID]?.cancel()
+        retryTasks[repoID] = nil
+        defer { scheduleRetryIfNeeded(repoID: repoID, using: state) }
+
         runIDByRepo[repoID] = UUID()
         runModeByRepo[repoID] = automatic ? "automatic" : "manual"
         checkpointSHAByRepo[repoID] = repo.gitState.commitSHA
@@ -224,7 +233,7 @@ final class VaultBridgeSyncCoordinator {
         // Demo repositories have no working copy on disk; report success
         // without touching Git so App Review sees a working dashboard.
         if state.isDemoMode {
-            await update(repo: repo, phase: .complete, message: "Up to date")
+            await update(repo: repo, phase: .complete, message: "Demo: all saved — you’re all set.")
             return
         }
 
@@ -259,7 +268,11 @@ final class VaultBridgeSyncCoordinator {
                info.syncState == .upToDate,
                remoteCheckIsFresh,
                state.shelteredEditsByRepo[repoID] == nil {
-                await update(repo: repo, phase: .complete, message: "Up to date")
+                if repo.gitState.verifiedCommitSHA == info.commitSHA, let verifiedAt = repo.gitState.lastVerifiedDate {
+                    await update(repo: repo, phase: .complete, message: "All saved at the last verified check.", verifiedAt: verifiedAt)
+                } else {
+                    await update(repo: repo, phase: .idle, message: "Saved here. Last server check is shown below.")
+                }
                 return
             }
 
@@ -386,12 +399,12 @@ final class VaultBridgeSyncCoordinator {
                     || outcome?.kind == .blockedByLocalChanges
                     || outcome?.kind == .diverged
                 let message = outcome?.message ?? "The server could not be checked"
-                if needsAttention {
+                if needsAttention || state.syncNeedsUserActionByRepo[repoID] == true {
                     await stopForAttention(message)
                 } else if outcome?.kind == .cancelled {
                     await update(repo: repo, phase: .idle, message: message)
                 } else {
-                    await update(repo: repo, phase: .failed, message: message)
+                    await update(repo: repo, phase: .failed, message: message, retrySuggested: true)
                 }
                 return
             }
@@ -427,46 +440,48 @@ final class VaultBridgeSyncCoordinator {
                     let pushError = state.pushErrorByRepo[repoID]
                     let outcome = state.pullOutcomeByRepo[repoID]
                     let message = pushError?.message ?? outcome?.message ?? "Upload could not be completed"
-                    if pushError?.isLFSRepairEligible == true || outcome?.kind == .diverged {
+                    if pushError?.isLFSRepairEligible == true || outcome?.kind == .diverged || state.syncNeedsUserActionByRepo[repoID] == true {
                         await stopForAttention(message)
                     } else if outcome?.kind == .cancelled {
                         await update(repo: repo, phase: .idle, message: message)
                     } else {
-                        await update(repo: repo, phase: .failed, message: message)
+                        await update(repo: repo, phase: .failed, message: message, retrySuggested: true)
                     }
                     return
                 }
             }
 
-            let movedChanges = shouldPush || pullKind == .fastForwarded || pullKind == .merged
-            let message: String
-            if shouldPush {
-                if pullKind == .merged {
-                    message = "Combined and uploaded"
-                } else if committed {
-                    message = "Saved and uploaded"
-                } else {
-                    message = "Uploaded"
-                }
-            } else if pullKind == .fastForwarded {
-                message = "Server notes brought onto this phone"
-            } else {
-                message = "Up to date"
+            await update(repo: repo, phase: .verifying, message: "Checking saved files and attachments")
+            let verified = try await state.verifyRepositoryForVaultBridge(repoID: repoID)
+            if verified.changeCount > 0 || stillChangingCount > 0 {
+                await update(repo: repo, phase: .idle, message: "Saved work is uploaded. New edits are waiting to sync.", retrySuggested: true)
+                return
             }
-            await update(repo: repo, phase: .verifying, message: "Verifying phone and server")
-            let suffix = stillChangingCount == 0 ? "" : (stillChangingCount == 1
-                ? ". 1 note is still changing and will be saved next time"
-                : ". \(stillChangingCount) notes are still changing and will be saved next time")
-            await update(repo: repo, phase: .complete, message: message + suffix)
-            if automatic, movedChanges, repo.syncNotificationsEnabled {
-                await VaultBridgeLocalNotifications.post(repo: repo, needsAttention: false)
+            guard verified.syncState == .upToDate,
+                  !verified.commitSHA.isEmpty,
+                  verified.commitSHA == verified.remoteCommitSHA,
+                  state.shelteredEditsByRepo[repoID] == nil else {
+                await update(repo: repo, phase: .idle, message: "Saved here. The server changed again; checking on the next sync.", retrySuggested: true)
+                return
             }
+            state.markVaultBridgeVerificationSucceeded(repoID: repoID, sha: verified.commitSHA)
+            await update(repo: repo, phase: .complete, message: "All saved — you’re all set. This iPhone and the server match.")
+            // Automatic successes are deliberately quiet. The persistent card
+            // carries the result; notifications are reserved for useful choices.
+
         } catch let error as LocalGitError {
-            if case .conflictSessionInProgress = error {
+            if case .suspiciousChanges(let review) = error {
+                state.safetyReviewByRepo[repoID] = review
+                await stopForAttention(error.localizedDescription)
+            } else if case .authenticationFailed = error {
+                await stopForAttention("Sign in again to finish uploading. Your saved work stays on this iPhone.")
+            } else if case .sshHostKeyTrustRequired = error {
+                await stopForAttention("Verify the server identity before syncing. Your saved work stays on this iPhone.")
+            } else if error.requiresUserAction {
                 await stopForAttention(error.localizedDescription)
             } else {
                 presentSyncError(error.localizedDescription, using: state, automatic: automatic)
-                await update(repo: repo, phase: .failed, message: error.localizedDescription)
+                await update(repo: repo, phase: .failed, message: error.localizedDescription, retrySuggested: true)
             }
         } catch is CancellationError {
             // An abandoned pull-to-refresh or torn-down task is not a failure;
@@ -474,7 +489,7 @@ final class VaultBridgeSyncCoordinator {
             await update(repo: repo, phase: .idle, message: "Sync cancelled")
         } catch {
             presentSyncError(error.localizedDescription, using: state, automatic: automatic)
-            await update(repo: repo, phase: .failed, message: error.localizedDescription)
+            await update(repo: repo, phase: .failed, message: error.localizedDescription, retrySuggested: true)
         }
     }
 
@@ -495,26 +510,47 @@ final class VaultBridgeSyncCoordinator {
     /// and debug log still carry the failure.
     private func presentSyncError(_ message: String, using state: AppState, automatic: Bool) {
         if automatic {
-            DebugLogger.shared.error("vaultbridge", message)
+            DebugLogger.shared.error("vaultbridge", "Automatic sync needs attention; review the vault status.")
         } else {
             state.showError(message: message, category: "vaultbridge")
         }
     }
 
-    private func update(repo: RepoConfig, phase: VaultBridgeSyncPhase, message: String) async {
+    private func update(repo: RepoConfig, phase: VaultBridgeSyncPhase, message: String, retrySuggested: Bool = false, verifiedAt: Date? = nil) async {
         let now = Date()
-        statusByRepo[repo.id] = VaultBridgeSyncStatus(phase: phase, message: message, date: now)
+        statusByRepo[repo.id] = VaultBridgeSyncStatus(phase: phase, message: message, date: verifiedAt ?? now, retrySuggested: retrySuggested)
         await VaultBridgeSyncJournal.shared.record(.init(
             repoID: repo.id,
             repoName: repo.displayName,
             phase: phase,
-            message: message,
+            message: phase == .failed ? "Sync did not finish" : phase == .attention ? "Human review needed" : phase.rawValue,
             date: now,
             runID: runIDByRepo[repo.id],
             mode: runModeByRepo[repo.id],
             progress: progress(for: phase),
             checkpointSHA: checkpointSHAByRepo[repo.id].flatMap { $0.isEmpty ? nil : $0 }
         ))
+    }
+
+    private func scheduleRetryIfNeeded(repoID: UUID, using state: AppState) {
+        guard status(for: repoID).retrySuggested,
+              state.repo(id: repoID)?.autoSyncEnabled == true,
+              !state.isDemoMode,
+              ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else {
+            if status(for: repoID).phase == .complete { retryCounts[repoID] = 0 }
+            return
+        }
+        let count = retryCounts[repoID, default: 0]
+        retryCounts[repoID] = count + 1
+        let delay = [60, 300, 900][min(count, 2)]
+        retryTasks[repoID] = Task { [weak self, weak state] in
+            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            guard let self, let state, UIApplication.shared.applicationState == .active,
+                  !state.isSyncing, !self.isSyncingAll else { return }
+            // Foreground entry remains the fallback after iOS suspends this task.
+            self.retryTasks[repoID] = nil
+            await self.syncRepository(repoID: repoID, using: state, automatic: true)
+        }
     }
 
     private func progress(for phase: VaultBridgeSyncPhase) -> Int {
@@ -548,6 +584,21 @@ final class VaultBridgeSyncCoordinator {
 }
 
 extension AppState {
+    func markVaultBridgeVerificationSucceeded(repoID: UUID, sha: String) {
+        guard let index = repoIndex(id: repoID) else { return }
+        repos[index].gitState.verifiedCommitSHA = sha
+        repos[index].gitState.lastVerifiedDate = Date()
+        markVaultBridgeRemoteCheckSucceeded(repoID: repoID)
+    }
+
+    func verifyRepositoryForVaultBridge(repoID: UUID) async throws -> LocalRepoInfo {
+        guard let repo = repo(id: repoID) else { throw LocalGitError.notCloned }
+        let credentials = authPayload(for: repo)
+        let serialized = try serializedRepository(repoID: repoID)
+        _ = try await serialized.withLease { try await $0.verifySync(pat: credentials) }
+        return try await inspectRepositoryForVaultBridge(repoID: repoID)
+    }
+
     /// Performs the single status pass that drives the optimized foreground
     /// decision and publishes it directly, avoiding a second detached scan.
     func inspectRepositoryForVaultBridge(repoID: UUID) async throws -> LocalRepoInfo {
