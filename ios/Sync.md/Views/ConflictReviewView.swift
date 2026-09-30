@@ -10,12 +10,14 @@ struct ConflictReviewView: View {
     @State private var loading = true
     @State private var busy = false
     @State private var unreadable = false
+    @State private var pendingChoice: ConflictFileDetail?
+    @State private var pendingStrategy: ConflictResolutionStrategy = .ours
 
     var body: some View {
         List {
             Section {
                 Label("Both originals are protected", systemImage: "checkmark.shield")
-                Text("Choose the result you want for each file. Nothing uploads until you finish.")
+                Text("Review the highlighted differences, then choose a result. Whole-file choices ask you to confirm before saving. Nothing uploads until you finish.")
                     .foregroundStyle(.secondary)
             }
             if loading { ProgressView("Finding files that need your choice") }
@@ -31,15 +33,22 @@ struct ConflictReviewView: View {
                             ForEach(differences, id: \.self) { Text($0).font(.callout).textSelection(.enabled) }
                         }
                     }
-                    version(detail.ours, title: "This iPhone")
-                    version(detail.theirs, title: "Server")
+                    ConflictComparisonView(detail: detail)
+                    version(detail.ours, title: "Full iPhone original")
+                    version(detail.theirs, title: "Full server original")
+                    if !detail.isRenameRename,
+                       detail.ours?.isBinary == false, detail.theirs?.isBinary == false,
+                       let phone = detail.ours?.content, let server = detail.theirs?.content,
+                       String(data: phone, encoding: .utf8) != nil, String(data: server, encoding: .utf8) != nil {
+                        NavigationLink("Choose changes one by one") { GuidedConflictMergeView(repoID: repoID, detail: detail) }
+                    }
                     if detail.isRenameRename {
                         NavigationLink("Choose filename and combine edits", value: ConflictEditorDestination(repoID: repoID, path: detail.lookupPath))
                     } else {
-                        Button(detail.ours == nil ? "Keep the iPhone deletion" : "Use this iPhone’s version") { choose(detail, .ours) }
-                        Button(detail.theirs == nil ? "Keep the server deletion" : "Use server version") { choose(detail, .theirs) }
+                        Button(detail.ours == nil ? "Keep the iPhone deletion" : "Use this iPhone’s version") { previewChoice(detail, .ours) }
+                        Button(detail.theirs == nil ? "Keep the server deletion" : "Use server version") { previewChoice(detail, .theirs) }
                         if detail.ours?.isBinary != true && detail.theirs?.isBinary != true {
-                            NavigationLink("Combine edits", value: ConflictEditorDestination(repoID: repoID, path: detail.lookupPath))
+                            NavigationLink("Edit combined text manually", value: ConflictEditorDestination(repoID: repoID, path: detail.lookupPath))
                         }
                         if detail.ours?.content != nil && detail.theirs?.content != nil && !detail.lookupPath.hasPrefix(".obsidian/") {
                             Button("Keep both copies") {
@@ -62,6 +71,20 @@ struct ConflictReviewView: View {
             if !loading && !unreadable && details.isEmpty {
                 Section {
                     Label("Your choices are saved", systemImage: "checkmark.circle")
+                    if state.conflictSessionByRepo[repoID]?.kind == .merge {
+                        Button("Save locally and review recovery options") {
+                            busy = true
+                            Task {
+                                await state.completeMerge(repoID: repoID)
+                                await reload(); busy = false
+                            }
+                        }
+                        .disabled(busy || state.isSyncing)
+                        Text("Saves the merge on this iPhone without uploading. You can then recover a file before syncing.").font(.caption)
+                    } else if state.conflictSessionByRepo[repoID]?.isActive != true {
+                        NavigationLink("Recover previous work") { FileRecoveryView(repoID: repoID) }
+                            .accessibilityIdentifier("merge.recover")
+                    }
                     Button("Save and finish syncing") {
                         busy = true
                         Task {
@@ -80,6 +103,15 @@ struct ConflictReviewView: View {
             }
         }
         .navigationTitle("Review your files")
+        .confirmationDialog("Replace the entire file?", isPresented: Binding(get: { pendingChoice != nil }, set: { if !$0 { pendingChoice = nil } })) {
+            Button(pendingStrategy == .ours ? "Save iPhone version" : "Save server version", role: .destructive) {
+                if let detail = pendingChoice { choose(detail, pendingStrategy) }
+                pendingChoice = nil
+            }
+            Button("Go back to differences") { pendingChoice = nil }
+        } message: {
+            Text("This keeps the selected version of the whole file, including its deletions. Unique edits from the other version will not appear in the result. Choose changes one by one to keep edits from both sides. Originals remain in saved checkpoints.")
+        }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done for now") { dismiss() } } }
         .navigationDestination(for: ConflictEditorDestination.self) { destination in
@@ -114,6 +146,10 @@ struct ConflictReviewView: View {
             let a = value(phone[key]), b = value(server[key])
             return a == b ? nil : "\(key)\nThis iPhone: \(a)\nServer: \(b)"
         }
+    }
+    private func previewChoice(_ detail: ConflictFileDetail, _ strategy: ConflictResolutionStrategy) {
+        pendingStrategy = strategy
+        pendingChoice = detail
     }
     private func choose(_ detail: ConflictFileDetail, _ strategy: ConflictResolutionStrategy) {
         busy = true

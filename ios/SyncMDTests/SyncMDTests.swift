@@ -11,6 +11,52 @@ final class SyncMDTests: XCTestCase {
         _ = git_libgit2_init()
     }
 
+    func testConflictComparisonShowsLongFileChangesWithLineNumbers() {
+        let lines = (1...5000).map { "Unchanged line \($0)" }
+        var phone = lines, server = lines
+        phone[2500] = "Phone journal continuation"
+        server[100] = "Server completed checkbox"
+        let diff = ConflictComparison(phone: phone.joined(separator: "\n"), server: server.joined(separator: "\n"))
+        XCTAssertEqual(diff.phoneOnlyCount, 2)
+        XCTAssertEqual(diff.serverOnlyCount, 2)
+        XCTAssertLessThan(diff.rows.count, 25)
+        XCTAssertTrue(diff.rows.contains { $0.kind == .phone && $0.phoneLine == 2501 && $0.text == "Phone journal continuation" })
+        XCTAssertTrue(diff.rows.contains { $0.kind == .server && $0.serverLine == 101 })
+    }
+
+    func testConflictComparisonPreservesBlankRepeatedAndFinalLines() {
+        for pair in [("a\na\n\nend\n", "a\n\nnew\na\nend"), ("", "new"), ("deleted", ""), ("same", "same")] {
+            let diff = ConflictComparison(phone: pair.0, server: pair.1, context: 100)
+            if pair.0 == pair.1 { XCTAssertEqual(diff.phoneOnlyCount + diff.serverOnlyCount, 0); continue }
+            let phone = diff.rows.filter { $0.kind == .phone || $0.kind == .context }.map(\.text).joined(separator: "\n")
+            let server = diff.rows.filter { $0.kind == .server || $0.kind == .context }.map(\.text).joined(separator: "\n")
+            XCTAssertEqual(phone, pair.0)
+            XCTAssertEqual(server, pair.1)
+        }
+    }
+
+    func testGuidedMergeRequiresEveryChoiceAndPreservesSharedLines() {
+        let phone = "header\nphone journal\ncontext1\ncontext2\ncontext3\nunchecked\nfooter\n"
+        let server = "header\nold journal\ncontext1\ncontext2\ncontext3\nchecked\nfooter\n"
+        let draft = ConflictMergeDraft(phone: phone, server: server)
+        XCTAssertEqual(draft.changes.count, 2)
+        XCTAssertNil(draft.result(choices: [:]))
+        let ids = draft.changes.map(\.id)
+        XCTAssertNil(draft.result(choices: [ids[0]: .phone]))
+        XCTAssertEqual(draft.result(choices: [ids[0]: .phone, ids[1]: .server]), "header\nphone journal\ncontext1\ncontext2\ncontext3\nchecked\nfooter\n")
+        XCTAssertEqual(ConflictMergeDraft(phone: phone, server: phone).result(choices: [:]), phone)
+    }
+
+    func testGuidedMergeCanReproduceEitherOriginalAndKeepBoth() {
+        for pair in [("a\na\n\nend\n", "a\n\nnew\na\nend"), ("", "new"), ("deleted", ""), ("🙏 café\n", "🙏 tea\n")] {
+            let draft = ConflictMergeDraft(phone: pair.0, server: pair.1)
+            XCTAssertEqual(draft.result(choices: Dictionary(uniqueKeysWithValues: draft.changes.map { ($0.id, .phone) })), pair.0)
+            XCTAssertEqual(draft.result(choices: Dictionary(uniqueKeysWithValues: draft.changes.map { ($0.id, .server) })), pair.1)
+        }
+        let draft = ConflictMergeDraft(phone: "header\nphone\nfooter", server: "header\nserver\nfooter")
+        XCTAssertEqual(draft.result(choices: [draft.changes[0].id: .both]), "header\nphone\nserver\nfooter")
+    }
+
     func testSmoke() {
         XCTAssertTrue(true)
     }
@@ -5100,6 +5146,13 @@ final class SyncMDTests: XCTestCase {
         let after = try await service.repoInfo()
         XCTAssertEqual(after.changeCount, 0)
         XCTAssertEqual(before.commitSHA, after.commitSHA)
+        let mergeDetail = try await service.commitDetail(oid: before.commitSHA)
+        XCTAssertEqual(mergeDetail.parentOIDs.count, 2)
+        try await service.restoreFile(path: "settings.json", from: mergeDetail.parentOIDs[0])
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("settings.json"), encoding: .utf8), "{\"choice\":\"phone\"}\n")
+        try await service.restoreFile(path: "settings.json", from: mergeDetail.parentOIDs[1])
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("settings.json"), encoding: .utf8), "{\"choice\":\"server\"}\n")
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("Today.md"), encoding: .utf8), "Afternoon journal entry\n")
     }
 
     func testLocalGitServiceCompleteMergeCreatesCommitAndCleansState() async throws {

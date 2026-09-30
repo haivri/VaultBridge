@@ -118,7 +118,8 @@ struct ConflictEditorView: View {
                 if oursIsBinary || theirsIsBinary {
                     binaryNotice
                 } else {
-                    sideBySidePanes
+                    ConflictComparisonView(detail: detail)
+                    DisclosureGroup("Full originals") { sideBySidePanes }
                     resultEditor
                     actionButtons
                 }

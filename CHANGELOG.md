@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1
+
+- Show line-numbered iPhone/server differences with unchanged text collapsed.
+- Combine conflicting text by choosing each changed section, with editable choices and a complete result preview.
+- Confirm whole-file replacements and offer local-only merge completion before recovery.
+- Recover either original directly from a recent merge checkpoint.
+
 ## 1.0.0
 
 - Native SwiftUI-only release.

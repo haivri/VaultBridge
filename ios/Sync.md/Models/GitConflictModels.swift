@@ -27,7 +27,7 @@ struct ConflictSession: Codable, Sendable, Equatable {
 }
 
 /// One side of a 3-way merge conflict (ancestor / ours / theirs).
-struct ConflictFileSide: Sendable, Equatable {
+struct ConflictFileSide: Sendable, Hashable {
     let path: String
     let oid: String
     let isBinary: Bool
@@ -36,7 +36,7 @@ struct ConflictFileSide: Sendable, Equatable {
 
 /// Full conflict information for one logical conflict, gathered from libgit2's
 /// 3-stage index. For rename/rename conflicts the sides have different `path`s.
-struct ConflictFileDetail: Sendable, Equatable {
+struct ConflictFileDetail: Sendable, Hashable {
     let lookupPath: String
     let ancestor: ConflictFileSide?
     let ours: ConflictFileSide?
