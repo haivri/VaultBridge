@@ -33,3 +33,15 @@ with your own identity and provisioning profile, then recreate the ZIP/IPA.
 - Analytics is disabled. Test builds can explicitly set
   `ONBOARDING_ANALYTICS_ENABLED=1` and provide their own endpoint.
 - The optional Assist relay has no public default endpoint.
+
+## 1.1.2 recovery validation (2026-10-11)
+
+The signed simulator suite passed all 209 tests, including a disposable local
+Git remote/clone with unsaved working-copy edits, unavailable-bookmark handling,
+and occupied-destination preservation. An initial unsigned simulator run failed
+keychain-dependent tests; rerunning with simulator ad hoc signing passed the
+entire suite. The Release iPhone build passed and was installed in place with
+the existing valid ad hoc profile. Launch and continuing process presence were
+verified. A read-only metadata check confirmed the existing repository identity
+and folder bookmark were retained and its cleared clone status was recovered.
+No user-vault clone, replacement, reset, or manual metadata injection was used.

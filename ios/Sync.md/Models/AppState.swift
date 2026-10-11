@@ -949,44 +949,56 @@ final class AppState {
 
     // MARK: - Filesystem Validation
 
-    /// Check all repos marked as cloned and reset any whose `.git` directory
-    /// has been deleted from the filesystem (e.g. via Files app).
+    /// A failed filesystem probe can mean locked device data or an unavailable
+    /// file provider. It is never evidence that the saved clone should be erased.
     func validateClonedRepos() {
         if isDemoMode { return }
-        var didChange = false
-        for (index, repo) in repos.enumerated() where repo.isCloned {
-            // A vault behind a security-scoped bookmark can be temporarily
-            // unreachable (file provider not ready, stale bookmark after a
-            // restore). Retry resolution here; if the real folder still cannot
-            // be reached, skip validation entirely — `vaultURL` would fall back
-            // to the in-app Documents path, whose missing `.git` would wrongly
-            // reset a healthy external clone and funnel the user into re-cloning.
+        for repo in repos where repo.isCloned {
             if repo.customVaultBookmarkData != nil, resolvedCustomURLs[repo.id] == nil {
                 resolveVaultBookmark(for: repo.id)
-                if resolvedCustomURLs[repo.id] == nil { continue }
-            }
-
-            let vaultDir = vaultURL(for: repo.id)
-            let gitService = gitRepositoryFactory(vaultDir)
-
-            if !gitService.hasGitDirectory {
-                repos[index].gitState = .empty
-                changeCounts[repo.id] = 0
-                statusEntriesByRepo[repo.id] = []
-                syncStateByRepo[repo.id] = .unknown
-                diffByRepo[repo.id] = .empty
-                branchesByRepo[repo.id] = .empty
-                conflictSessionByRepo[repo.id] = .none
-                commitHistoryByRepo[repo.id] = []
-                commitHistoryHasMoreByRepo[repo.id] = false
-                commitDetailByRepo[repo.id] = [:]
-                stashesByRepo[repo.id] = []
-                didChange = true
             }
         }
-        if didChange {
-            saveRepos()
+    }
+
+    private enum VaultAccessError: LocalizedError {
+        case unavailable, existingFiles
+        var errorDescription: String? {
+            switch self {
+            case .unavailable:
+                return "The existing vault folder is unavailable. Unlock the phone and reconnect its folder in repository settings. Your saved repository and files have been kept."
+            case .existingFiles:
+                return "This folder already contains files. VaultBridge will not move or replace them. Reconnect the existing repository in settings, or choose a separate empty location for a new clone."
+            }
         }
+    }
+
+    private func accessibleVaultURL(for repoID: UUID) throws -> URL {
+        guard let repo = repo(id: repoID) else { throw VaultAccessError.unavailable }
+        if repo.customVaultBookmarkData != nil, resolvedCustomURLs[repoID] == nil {
+            resolveVaultBookmark(for: repoID)
+            guard resolvedCustomURLs[repoID] != nil else { throw VaultAccessError.unavailable }
+        }
+        return vaultURL(for: repoID)
+    }
+
+    /// Repair old, cleared metadata from the existing local Git repository only.
+    /// No fetch, merge, checkout, clone, or file relocation occurs here.
+    @discardableResult
+    func reconnectExistingVault(repoID: UUID) async throws -> Bool {
+        guard let original = repo(id: repoID), !isDemoMode else { return false }
+        let url = try accessibleVaultURL(for: repoID)
+        let service = gitRepositoryFactory(url)
+        guard service.hasGitDirectory else { return false }
+        let info = try await service.repoInfo()
+        guard !info.commitSHA.isEmpty,
+              let index = repoIndex(id: repoID), repos[index] == original else { return false }
+        repos[index].gitState.commitSHA = info.commitSHA
+        repos[index].gitState.branch = info.branch
+        changeCounts[repoID] = info.changeCount
+        statusEntriesByRepo[repoID] = info.statusEntries
+        syncStateByRepo[repoID] = info.syncState
+        saveRepos()
+        return true
     }
 
     // MARK: - Change Detection
@@ -1014,25 +1026,12 @@ final class AppState {
     func detectChanges(repoID: UUID, skipIfRecentlyStartedWithin interval: TimeInterval? = nil) {
         guard let repo = repo(id: repoID), repo.isCloned else { return }
         if isDemoMode { return }
-        let vaultDir = vaultURL(for: repoID)
+        let vaultDir: URL
+        do { vaultDir = try accessibleVaultURL(for: repoID) }
+        catch { return }
         let gitService = gitRepositoryFactory(vaultDir)
-
         guard gitService.hasGitDirectory else {
-            // .git directory was removed — reset cloned state
-            if let idx = repoIndex(id: repoID) {
-                repos[idx].gitState = .empty
-                saveRepos()
-            }
-            changeCounts[repoID] = 0
-            statusEntriesByRepo[repoID] = []
             syncStateByRepo[repoID] = .unknown
-            diffByRepo[repoID] = .empty
-            branchesByRepo[repoID] = .empty
-            conflictSessionByRepo[repoID] = .none
-            commitHistoryByRepo[repoID] = []
-            commitHistoryHasMoreByRepo[repoID] = false
-            commitDetailByRepo[repoID] = [:]
-            stashesByRepo[repoID] = []
             return
         }
 
@@ -2822,7 +2821,7 @@ final class AppState {
     // MARK: - Git Operations (libgit2)
 
     func clone(repoID: UUID) async {
-        guard let idx = repoIndex(id: repoID) else {
+        guard repoIndex(id: repoID) != nil else {
             showError(message: String(localized: "Repository not found"))
             return
         }
@@ -2844,32 +2843,29 @@ final class AppState {
         do {
             let fm = FileManager.default
 
-            // If the user configured a default save location after this repo
-            // was first added, adopt it now so the (re-)clone lands in the
-            // chosen folder instead of the in-app Documents directory.
-            if repos[idx].customVaultBookmarkData == nil,
+            // Reconnect a healthy existing copy before considering a download.
+            if try await reconnectExistingVault(repoID: repoID) {
+                isSyncing = false
+                syncingRepoID = nil
+                return
+            }
+            guard let currentIndex = repoIndex(id: repoID) else { throw VaultAccessError.unavailable }
+            let current = repos[currentIndex]
+            let currentURL = try accessibleVaultURL(for: repoID)
+            guard !fm.fileExists(atPath: currentURL.path),
+                  !current.isExternalLocalRepository, !current.isCloned else {
+                throw VaultAccessError.existingFiles
+            }
+            if current.customVaultBookmarkData == nil,
                let defaultBookmark = defaultSaveLocationBookmarkData {
-                let staleVaultDir = repos[idx].defaultVaultURL
-                repos[idx].customVaultBookmarkData = defaultBookmark
-                repos[idx].customLocationIsParent = true
-                saveRepos()
+                repos[currentIndex].customVaultBookmarkData = defaultBookmark
+                repos[currentIndex].customLocationIsParent = true
                 resolveVaultBookmark(for: repoID)
-                if fm.fileExists(atPath: staleVaultDir.path) {
-                    _ = try? Self.moveAsideExistingVault(at: staleVaultDir)
-                }
+                saveRepos()
             }
-
-            let repo = repos[idx]
-            let vaultDir = vaultURL(for: repoID)
-
-            // git clone needs a clean target, but never delete an existing
-            // folder outright: a stale "not cloned" state or a corrupted
-            // repository funnels users here while the folder may still hold
-            // the only copy of unpushed work. Move it aside instead so the
-            // contents stay recoverable from the Files app.
-            if fm.fileExists(atPath: vaultDir.path) {
-                try Self.moveAsideExistingVault(at: vaultDir)
-            }
+            guard let repo = repo(id: repoID) else { throw VaultAccessError.unavailable }
+            let vaultDir = try accessibleVaultURL(for: repoID)
+            guard !fm.fileExists(atPath: vaultDir.path) else { throw VaultAccessError.existingFiles }
 
             // Ensure parent directory exists (git clone creates the target dir itself)
             let parentDir = vaultDir.deletingLastPathComponent()

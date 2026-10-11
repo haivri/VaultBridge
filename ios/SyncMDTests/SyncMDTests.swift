@@ -2068,13 +2068,101 @@ final class SyncMDTests: XCTestCase {
         state.validateClonedRepos()
         XCTAssertEqual(state.repo(id: externalRepo.id)?.isCloned, true)
 
-        // A managed (in-Documents) vault with a missing .git still resets.
+        // Device protection can also temporarily hide managed storage. Preserve it.
         let managedFixture = try GitFixtureFactory.make(state: .clean)
         defer { managedFixture.cleanup() }
         managedFixture.repository.hasGitDirectoryValue = false
         state.repos = [managedFixture.repoConfig]
         state.validateClonedRepos()
-        XCTAssertEqual(state.repo(id: managedFixture.repoConfig.id)?.isCloned, false)
+        XCTAssertEqual(state.repo(id: managedFixture.repoConfig.id)?.isCloned, true)
+    }
+
+    @MainActor
+    func testReconnectClearedCloneStatePreservesLocalChangesWithoutNetwork() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        let persistence = FileManager.default.temporaryDirectory.appendingPathComponent("reconnect-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: persistence) }
+        let state = AppState(gitRepositoryFactory: { _ in fixture.repository }, reposFileURL: persistence, loadPersistedState: false)
+        var config = fixture.repoConfig
+        config.gitState = .empty
+        state.repos = [config]
+        await state.clone(repoID: config.id)
+        XCTAssertTrue(state.repo(id: config.id)?.isCloned == true)
+        XCTAssertEqual(state.repo(id: config.id)?.gitState.commitSHA, fixture.repository.repoInfoResult.commitSHA)
+        XCTAssertEqual(state.statusEntriesByRepo[config.id], fixture.repository.repoInfoResult.statusEntries)
+        XCTAssertTrue(fixture.repository.cloneRemoteURLs.isEmpty)
+        XCTAssertEqual(fixture.repository.commitLocalCallCount, 0)
+        XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 0)
+    }
+
+    @MainActor
+    func testReconnectDisposableCloneKeepsUnsavedFilesAndRemoteHead() async throws {
+        let fm = FileManager.default
+        let source = try makeTemporaryGitRepository(prefix: "ReconnectRemote")
+        let clone = fm.temporaryDirectory.appendingPathComponent("ReconnectCopy-\(UUID())")
+        let persistence = fm.temporaryDirectory.appendingPathComponent("ReconnectSettings-\(UUID()).json")
+        defer {
+            try? fm.removeItem(at: source)
+            try? fm.removeItem(at: clone)
+            try? fm.removeItem(at: persistence)
+        }
+        let service = LocalGitService(localURL: source)
+        try "saved".write(to: source.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try await service.stage(path: "note.txt")
+        let head = try await service.commitLocal(message: "Fixture", authorName: "Test", authorEmail: "test@example.test")
+        let copy = LocalGitService(localURL: clone)
+        _ = try await copy.clone(remoteURL: source.path, pat: "")
+        let note = clone.appendingPathComponent("note.txt")
+        try "unsaved phone changes".write(to: note, atomically: true, encoding: .utf8)
+        let config = RepoConfig(repoURL: "https://example.test/notes.git", branch: "main", authorName: "Test", authorEmail: "test@example.test", vaultFolderName: "fixture")
+        let state = AppState(gitRepositoryFactory: { _ in copy }, reposFileURL: persistence, loadPersistedState: false)
+        state.repos = [config]
+        let recovered = try await state.reconnectExistingVault(repoID: config.id)
+        XCTAssertTrue(recovered)
+        XCTAssertEqual(state.repo(id: config.id)?.gitState.commitSHA, head)
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "unsaved phone changes")
+        let remoteInfo = try await service.repoInfo()
+        XCTAssertEqual(remoteInfo.commitSHA, head)
+        XCTAssertEqual(try String(contentsOf: source.appendingPathComponent("note.txt"), encoding: .utf8), "saved")
+    }
+
+    @MainActor
+    func testUnavailableBookmarkNeverClearsStateOrClonesFallback() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        let state = AppState(gitRepositoryFactory: { _ in fixture.repository }, loadPersistedState: false)
+        var config = fixture.repoConfig
+        config.customVaultBookmarkData = Data("unresolvable".utf8)
+        state.repos = [config]
+        state.detectChanges(repoID: config.id)
+        XCTAssertEqual(state.repo(id: config.id)?.gitState, config.gitState)
+        state.repos[0].gitState = .empty
+        await state.clone(repoID: config.id)
+        XCTAssertTrue(state.showError)
+        XCTAssertTrue(fixture.repository.cloneRemoteURLs.isEmpty)
+        XCTAssertEqual(fixture.repository.repoInfoCallCount, 0)
+    }
+
+    @MainActor
+    func testCloneRefusesExistingFilesWithoutMovingThem() async throws {
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        fixture.repository.hasGitDirectoryValue = false
+        var config = fixture.repoConfig
+        config.gitState = .empty
+        config.vaultFolderName = "preserve-\(UUID())"
+        let directory = config.defaultVaultURL
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let note = directory.appendingPathComponent("note.txt")
+        try "unsent work".write(to: note, atomically: true, encoding: .utf8)
+        let state = AppState(gitRepositoryFactory: { _ in fixture.repository }, loadPersistedState: false)
+        state.repos = [config]
+        await state.clone(repoID: config.id)
+        XCTAssertTrue(state.showError)
+        XCTAssertEqual(try String(contentsOf: note, encoding: .utf8), "unsent work")
+        XCTAssertTrue(fixture.repository.cloneRemoteURLs.isEmpty)
     }
 
     @MainActor
@@ -3050,6 +3138,7 @@ final class SyncMDTests: XCTestCase {
     func testAppStateCloneUnknownSSHHostKeyPromptsInsteadOfShowingGenericError() async throws {
         let repoInfo = LocalRepoInfo(branch: "main", commitSHA: "1111111111111111111111111111111111111111", changeCount: 0)
         let repository = FakeGitRepository(repoInfoResult: repoInfo)
+        repository.hasGitDirectoryValue = false
         let trustError = GitLFSSSHHostKeyTrustError.unknownHostKey(
             host: "forgejo.example.com",
             port: 22,
@@ -3088,6 +3177,7 @@ final class SyncMDTests: XCTestCase {
     func testTrustingPendingSSHHostKeyPersistsFingerprintAndRetriesClone() async throws {
         let repoInfo = LocalRepoInfo(branch: "main", commitSHA: "2222222222222222222222222222222222222222", changeCount: 0)
         let repository = FakeGitRepository(repoInfoResult: repoInfo)
+        repository.hasGitDirectoryValue = false
         let trustedFingerprint = "SHA256:clone-trusted-\(UUID().uuidString)"
         let trustError = GitLFSSSHHostKeyTrustError.unknownHostKey(
             host: "forgejo-retry.example.com",
@@ -3134,6 +3224,7 @@ final class SyncMDTests: XCTestCase {
     func testCancelPendingSSHHostKeyTrustDoesNotPersistOrRetry() async throws {
         let repoInfo = LocalRepoInfo(branch: "main", commitSHA: "4444444444444444444444444444444444444444", changeCount: 0)
         let repository = FakeGitRepository(repoInfoResult: repoInfo)
+        repository.hasGitDirectoryValue = false
         let trustError = GitLFSSSHHostKeyTrustError.unknownHostKey(
             host: "forgejo-cancel.example.com",
             port: 22,

@@ -156,6 +156,9 @@ struct VaultView: View {
             state.detectChanges(repoID: repoID, skipIfRecentlyStartedWithin: 60)
         }
         .task {
+            if repo?.isCloned == false {
+                _ = try? await state.reconnectExistingVault(repoID: repoID)
+            }
             if VaultBridgeNotificationRouter.shared.repoID == repoID {
                 await state.loadConflictSession(repoID: repoID)
                 if conflictedFileCount > 0 { showReview = true }
@@ -748,9 +751,9 @@ struct VaultView: View {
             Spacer()
 
             BEmptyState(
-                title: String(localized: "Not Cloned"),
-                subtitle: String(localized: "This repository hasn't been cloned yet.\nTap below to download it."),
-                actionTitle: String(localized: "Clone Repository")
+                title: String(localized: "Connect Repository"),
+                subtitle: String(localized: "Check for an existing local repository first. A download starts only when the destination does not contain existing files."),
+                actionTitle: String(localized: "Reconnect or Download")
             ) {
                 Task { await state.clone(repoID: repoID) }
             }

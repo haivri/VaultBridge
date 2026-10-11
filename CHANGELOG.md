@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2
+
+- Preserve saved clone state when device protection or a file provider hides the repository temporarily.
+- Reconnect an existing local Git repository when old versions cleared its clone metadata.
+- Refuse to move or replace an occupied destination through the clone action.
+- Show reconnect/download wording instead of declaring an existing vault un-cloned.
+
 ## 1.1.1
 
 - Show line-numbered iPhone/server differences with unchanged text collapsed.
