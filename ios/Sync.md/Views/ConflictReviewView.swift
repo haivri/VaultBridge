@@ -40,7 +40,8 @@ struct ConflictReviewView: View {
                        detail.ours?.isBinary == false, detail.theirs?.isBinary == false,
                        let phone = detail.ours?.content, let server = detail.theirs?.content,
                        String(data: phone, encoding: .utf8) != nil, String(data: server, encoding: .utf8) != nil {
-                        NavigationLink("Choose changes one by one") { GuidedConflictMergeView(repoID: repoID, detail: detail) }
+                        NavigationLink("Merge into one file") { GuidedConflictMergeView(repoID: repoID, detail: detail) }
+                            .accessibilityIdentifier("conflict.mergeOneFile")
                     }
                     if detail.isRenameRename {
                         NavigationLink("Choose filename and combine edits", value: ConflictEditorDestination(repoID: repoID, path: detail.lookupPath))
@@ -51,13 +52,17 @@ struct ConflictReviewView: View {
                             NavigationLink("Edit combined text manually", value: ConflictEditorDestination(repoID: repoID, path: detail.lookupPath))
                         }
                         if detail.ours?.content != nil && detail.theirs?.content != nil && !detail.lookupPath.hasPrefix(".obsidian/") {
-                            Button("Keep both copies") {
-                                busy = true
-                                Task {
-                                    let name = URL(fileURLWithPath: detail.theirs!.path)
-                                    let relative = (detail.theirs!.path as NSString).deletingPathExtension + " (Server copy \(UUID().uuidString.prefix(8)))" + (name.pathExtension.isEmpty ? "" : "." + name.pathExtension)
-                                    _ = await state.resolveConflictKeepingBoth(repoID: repoID, detail: detail, serverCopyPath: relative)
-                                    await reload(); busy = false
+                            DisclosureGroup("Keep originals as two separate files") {
+                                Text("This creates an extra server copy. To combine the text in the original file, use Merge into one file.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Button("Create two separate files") {
+                                    busy = true
+                                    Task {
+                                        let name = URL(fileURLWithPath: detail.theirs!.path)
+                                        let relative = (detail.theirs!.path as NSString).deletingPathExtension + " (Server copy \(UUID().uuidString.prefix(8)))" + (name.pathExtension.isEmpty ? "" : "." + name.pathExtension)
+                                        _ = await state.resolveConflictKeepingBoth(repoID: repoID, detail: detail, serverCopyPath: relative)
+                                        await reload(); busy = false
+                                    }
                                 }
                             }
                         }
@@ -110,7 +115,7 @@ struct ConflictReviewView: View {
             }
             Button("Go back to differences") { pendingChoice = nil }
         } message: {
-            Text("This keeps the selected version of the whole file, including its deletions. Unique edits from the other version will not appear in the result. Choose changes one by one to keep edits from both sides. Originals remain in saved checkpoints.")
+            Text("This keeps the selected version of the whole file, including its deletions. Unique edits from the other version will not appear in the result. Use Merge into one file to keep edits from both sides. Originals remain in saved checkpoints.")
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done for now") { dismiss() } } }

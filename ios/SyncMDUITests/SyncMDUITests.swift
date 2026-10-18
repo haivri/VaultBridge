@@ -45,15 +45,15 @@ final class SyncMDUITests: XCTestCase {
             XCTAssertTrue(open.waitForExistence(timeout: 20)); open.tap()
         }
         XCTAssertTrue(next.waitForExistence(timeout: 10)); next.tap()
-        let guided = app.buttons["Choose changes one by one"]
+        let guided = app.buttons["conflict.mergeOneFile"]
         for _ in 0..<5 where !guided.exists { app.swipeUp() }
         XCTAssertTrue(guided.waitForExistence(timeout: 10)); guided.tap()
         let phone = app.buttons["Keep iPhone"]
         XCTAssertTrue(phone.waitForExistence(timeout: 10))
-        XCTAssertFalse(app.buttons["Save combined result"].exists)
+        XCTAssertFalse(app.buttons["Save merged file"].exists)
         phone.tap()
         app.buttons["Keep Server"].tap()
-        let save = app.buttons["Save combined result"]
+        let save = app.buttons["Save merged file"]
         for _ in 0..<4 where !save.exists { app.swipeUp() }
         XCTAssertTrue(save.waitForExistence(timeout: 5))
         let screenshot = XCTAttachment(screenshot: app.screenshot())

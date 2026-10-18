@@ -45,3 +45,17 @@ the existing valid ad hoc profile. Launch and continuing process presence were
 verified. A read-only metadata check confirmed the existing repository identity
 and folder bookmark were retained and its cleared clone status was recovered.
 No user-vault clone, replacement, reset, or manual metadata injection was used.
+
+## 1.1.3 merge validation (2026-10-18)
+
+The signed simulator suite passed all 214 unit/integration tests and all three
+UI tests. A disposable bare remote, independent phone/server clones, and a fresh
+verification clone exercised a daily-note content conflict, single-file merge,
+normal push, new journal preservation, and a moved note. Regression cases cover
+adjacent inserts/replacements, overlapping edits, deletions, reopened checkboxes,
+identical edits, repeated lines, Unicode, and final newlines. UI tests verified
+editable merge choices, saving, and recovery without an upload.
+
+The Release iPhone build passed, its signature was verified, and version 1.1.3
+was installed in place with the existing app identity and valid ad hoc profile.
+The live vault was not used as a test fixture.

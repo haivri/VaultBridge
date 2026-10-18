@@ -119,13 +119,21 @@ struct ConflictEditorView: View {
                     binaryNotice
                 } else {
                     ConflictComparisonView(detail: detail)
+                    if detail.isContentConflict {
+                        NavigationLink("Merge into one file") {
+                            GuidedConflictMergeView(repoID: repoID, detail: detail)
+                        }
+                    }
                     DisclosureGroup("Full originals") { sideBySidePanes }
                     resultEditor
                     actionButtons
                 }
 
                 if detail.ours?.content != nil && detail.theirs?.content != nil && !path.hasPrefix(".obsidian/") {
-                    keepBothButton(detail)
+                    DisclosureGroup("Keep originals as two separate files") {
+                        Text("Creates an extra server copy instead of combining the text in the original file.")
+                        keepBothButton(detail)
+                    }
                 }
             }
             .padding(.horizontal, 16)
@@ -350,7 +358,7 @@ struct ConflictEditorView: View {
                 if ok { dismiss() }
             }
         } label: {
-            Label("Keep both copies", systemImage: "doc.on.doc")
+            Label("Create two separate files", systemImage: "doc.on.doc")
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
                 .tracking(1)
                 .foregroundStyle(Color.brutalSuccess)

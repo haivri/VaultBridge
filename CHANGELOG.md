@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.3
+
+- Merge edits into one original file using the shared ancestor, preserving independent additions, task updates, and journal entries.
+- Require a choice for overlapping edits and explicit saving of the preview.
+- Separate the two-file copy action from the single-file merge flow.
+
 ## 1.1.2
 
 - Preserve saved clone state when device protection or a file provider hides the repository temporarily.

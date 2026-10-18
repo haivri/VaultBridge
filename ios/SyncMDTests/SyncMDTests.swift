@@ -57,6 +57,111 @@ final class SyncMDTests: XCTestCase {
         XCTAssertEqual(draft.result(choices: [draft.changes[0].id: .both]), "header\nphone\nserver\nfooter")
     }
 
+    // Synthetic daily-note fixture: no personal vault contents belong in tests.
+    private var dailyMergeFixture: (base: String, phone: String, server: String, merged: String) {
+        let base = "## Tasks\n- [ ] \n\n## Routine\n- [ ] Stretch\n- [ ] Walk\n\n## Journal\nMorning entry."
+        let phone = base.replacingOccurrences(of: "- [ ] \n", with: "- [ ] Buy supplies\n- [ ] \n")
+        let server = base.replacingOccurrences(of: "- [ ] \n", with: "- [x] Evening ritual\n")
+            .replacingOccurrences(of: "- [ ] Stretch", with: "- [x] Stretch")
+            .replacingOccurrences(of: "- [ ] Walk", with: "- [x] Walk") + "\n\nEvening entry."
+        let merged = server.replacingOccurrences(of: "- [x] Evening ritual", with: "- [ ] Buy supplies\n- [x] Evening ritual")
+        return (base, phone, server, merged)
+    }
+
+    func testThreeWayDailyNoteKeepsIndependentEditsWithoutDuplicateTasks() {
+        let f = dailyMergeFixture
+        let draft = ConflictMergeDraft(phone: f.phone, server: f.server, ancestor: f.base)
+        XCTAssertTrue(draft.changes.isEmpty)
+        XCTAssertEqual(draft.result(choices: [:]), f.merged)
+        XCTAssertEqual(ConflictMergeDraft(phone: f.server, server: f.phone, ancestor: f.base).result(choices: [:]), f.merged)
+    }
+
+    func testThreeWayOverlappingEditsStillRequireChoice() {
+        let draft = ConflictMergeDraft(phone: "heading\nphone edit\nfooter\n", server: "heading\nserver edit\nfooter\n", ancestor: "heading\nold text\nfooter\n")
+        XCTAssertEqual(draft.changes.count, 1)
+        XCTAssertNil(draft.result(choices: [:]))
+        let id = draft.changes[0].id
+        XCTAssertEqual(draft.result(choices: [id: .both]), "heading\nphone edit\nserver edit\nfooter\n")
+        XCTAssertEqual(draft.result(choices: [id: .server]), "heading\nserver edit\nfooter\n")
+        let deletion = ConflictMergeDraft(phone: "heading\nfooter", server: "heading\nnew text\nfooter", ancestor: "heading\nold text\nfooter")
+        XCTAssertNil(deletion.result(choices: [:]), "Delete/modify must not silently discard either intent")
+    }
+
+    func testThreeWayRespectsDeletionsReopenedTasksAndIdenticalEdits() {
+        for pair in [("a\na\n\nend\n", "a\n\nnew\na\nend"), ("", "new"), ("deleted", ""), ("🙏 café\r\n", "🙏 tea\r\n"), ("- [x] Task", "- [ ] Task")] {
+            XCTAssertEqual(ConflictMergeDraft(phone: pair.0, server: pair.1, ancestor: pair.0).result(choices: [:]), pair.1)
+            XCTAssertEqual(ConflictMergeDraft(phone: pair.1, server: pair.0, ancestor: pair.0).result(choices: [:]), pair.1)
+            XCTAssertEqual(ConflictMergeDraft(phone: pair.1, server: pair.1, ancestor: pair.0).result(choices: [:]), pair.1)
+        }
+    }
+
+    func testThreeWayInsertionBoundariesAndOverlappingRanges() {
+        XCTAssertEqual(ConflictMergeDraft(phone: "a\ninsert\nb\nc", server: "a\nB\nc", ancestor: "a\nb\nc").result(choices: [:]), "a\ninsert\nB\nc")
+        XCTAssertEqual(ConflictMergeDraft(phone: "a\nb\ninsert\nc", server: "a\nB\nc", ancestor: "a\nb\nc").result(choices: [:]), "a\nB\ninsert\nc")
+        let insertions = ConflictMergeDraft(phone: "a\nphone\nb", server: "a\nserver\nb", ancestor: "a\nb")
+        XCTAssertEqual(insertions.changes.count, 1)
+        XCTAssertNil(insertions.result(choices: [:]))
+        let overlap = ConflictMergeDraft(phone: "a\nphone\ne", server: "a\nb\nserver\ne", ancestor: "a\nb\nc\nd\ne")
+        XCTAssertEqual(overlap.changes.count, 1)
+        XCTAssertEqual(overlap.result(choices: [overlap.changes[0].id: .server]), "a\nb\nserver\ne")
+    }
+
+    func testThreeWayMergedNoteRoundTripsThroughDisposableRemote() async throws {
+        let fm = FileManager.default
+        let seed = try makeTemporaryGitRepository(prefix: "MergeOneFile")
+        let remote = fm.temporaryDirectory.appendingPathComponent("MergeOrigin-\(UUID())")
+        let phoneURL = fm.temporaryDirectory.appendingPathComponent("MergePhone-\(UUID())")
+        let serverURL = fm.temporaryDirectory.appendingPathComponent("MergeServer-\(UUID())")
+        let verifyURL = fm.temporaryDirectory.appendingPathComponent("MergeVerify-\(UUID())")
+        defer { for url in [seed, remote, phoneURL, serverURL, verifyURL] { try? fm.removeItem(at: url) } }
+        let f = dailyMergeFixture
+        let initial = LocalGitService(localURL: seed)
+        try f.base.write(to: seed.appendingPathComponent("Daily.md"), atomically: true, encoding: .utf8)
+        try "Song notes".write(to: seed.appendingPathComponent("Song.md"), atomically: true, encoding: .utf8)
+        try await initial.stageAll()
+        let base = try await commitLocalFixtureChanges(using: initial, message: "Base")
+        try makeBareOrigin(at: remote, copyingObjectsFrom: seed, headSHA: base)
+        let phone = LocalGitService(localURL: phoneURL), server = LocalGitService(localURL: serverURL)
+        _ = try await phone.clone(remoteURL: remote.path, pat: "")
+        _ = try await server.clone(remoteURL: remote.path, pat: "")
+        try f.server.write(to: serverURL.appendingPathComponent("Daily.md"), atomically: true, encoding: .utf8)
+        try "Dream entry".write(to: serverURL.appendingPathComponent("Dream.md"), atomically: true, encoding: .utf8)
+        try fm.createDirectory(at: serverURL.appendingPathComponent("Songs"), withIntermediateDirectories: true)
+        try fm.moveItem(at: serverURL.appendingPathComponent("Song.md"), to: serverURL.appendingPathComponent("Songs/Song.md"))
+        try await server.stageAll()
+        _ = try await commitLocalFixtureChanges(using: server, message: "Server updates")
+        try await server.pushCurrentBranch(pat: "")
+        try f.phone.write(to: phoneURL.appendingPathComponent("Daily.md"), atomically: true, encoding: .utf8)
+        try await phone.stageAll()
+        _ = try await commitLocalFixtureChanges(using: phone, message: "Phone updates")
+        try await phone.fetchRemote(pat: "")
+        do {
+            _ = try await phone.mergeBranch(name: "origin/main", authorName: "Test", authorEmail: "test@example.invalid")
+            XCTFail("Adjacent edits should enter conflict review")
+        } catch LocalGitError.mergeConflictsDetected { }
+        let detail = try await phone.conflictDetail(path: "Daily.md")
+        func text(_ side: ConflictFileSide?) throws -> String {
+            try XCTUnwrap(side?.content.flatMap { String(data: $0, encoding: .utf8) })
+        }
+        let draft = ConflictMergeDraft(phone: try text(detail.ours), server: try text(detail.theirs), ancestor: try text(detail.ancestor))
+        let merged = try XCTUnwrap(draft.result(choices: [:]))
+        XCTAssertEqual(merged, f.merged)
+        try await phone.resolveConflictWithContent(path: detail.lookupPath, content: Data(merged.utf8), additionalPathsToRemove: [])
+        _ = try await phone.completeMerge(message: "Merge one file", authorName: "Test", authorEmail: "test@example.invalid")
+        try await phone.pushCurrentBranch(pat: "")
+        let verify = LocalGitService(localURL: verifyURL)
+        _ = try await verify.clone(remoteURL: remote.path, pat: "")
+        XCTAssertEqual(try String(contentsOf: verifyURL.appendingPathComponent("Daily.md"), encoding: .utf8), f.merged)
+        XCTAssertEqual(try String(contentsOf: verifyURL.appendingPathComponent("Dream.md"), encoding: .utf8), "Dream entry")
+        XCTAssertEqual(try String(contentsOf: verifyURL.appendingPathComponent("Songs/Song.md"), encoding: .utf8), "Song notes")
+        XCTAssertFalse(fm.fileExists(atPath: verifyURL.appendingPathComponent("Song.md").path))
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: verifyURL.path).filter { $0.hasPrefix("Daily") }, ["Daily.md"])
+        let info = try await verify.repoInfo()
+        XCTAssertEqual(info.changeCount, 0)
+        let commit = try await verify.commitDetail(oid: info.commitSHA)
+        XCTAssertEqual(commit.parentOIDs.count, 2)
+    }
+
     func testSmoke() {
         XCTAssertTrue(true)
     }

@@ -13,8 +13,8 @@ struct GuidedConflictMergeView: View {
     var body: some View {
         List {
             Section {
-                Text("Keep the changes you want, one section at a time. Unchanged text stays. You can change any choice before saving.")
-                Text("Both keeps the iPhone text followed by the server text; review it for duplicates.").font(.caption).foregroundStyle(.secondary)
+                Text("Combine edits in the original file. Changes made on only one side are included using the shared earlier version. If both sides changed the same text, choose what to keep below.")
+                Text("Both keeps both alternatives inside this file; review them for duplicates. Saving does not create a second file.").font(.caption).foregroundStyle(.secondary)
             }
             if let draft {
                 ForEach(Array(draft.changes.enumerated()), id: \.element.id) { index, block in
@@ -33,12 +33,16 @@ struct GuidedConflictMergeView: View {
                     }
                 }
                 Section {
-                    Text("\(choices.count) of \(draft.changes.count) changes chosen")
+                    if draft.changes.isEmpty {
+                        Label("The edits fit together in one file", systemImage: "checkmark.document")
+                    } else {
+                        Text("\(choices.count) of \(draft.changes.count) overlapping changes chosen")
+                    }
                     if let result = draft.result(choices: choices) {
                         DisclosureGroup("Preview complete result") {
                             Text(result).font(.callout.monospaced()).textSelection(.enabled)
                         }
-                        Button("Save combined result") {
+                        Button("Save merged file") {
                             saving = true
                             Task {
                                 await state.resolveConflictWithContent(repoID: repoID, path: detail.lookupPath, content: Data(result.utf8), expected: detail)
@@ -54,11 +58,14 @@ struct GuidedConflictMergeView: View {
             } else { ProgressView("Finding changed sections…") }
         }
         .disabled(saving || state.isSyncing)
-        .navigationTitle("Choose each change")
+        .navigationTitle("Merge into one file")
         .task {
             guard let phone = detail.ours?.content.flatMap({ String(data: $0, encoding: .utf8) }),
                   let server = detail.theirs?.content.flatMap({ String(data: $0, encoding: .utf8) }) else { return }
-            let result = await Task.detached(priority: .userInitiated) { ConflictMergeDraft(phone: phone, server: server) }.value
+            let ancestor = detail.ancestor?.content.flatMap { String(data: $0, encoding: .utf8) }
+            let result = await Task.detached(priority: .userInitiated) {
+                ConflictMergeDraft(phone: phone, server: server, ancestor: ancestor)
+            }.value
             guard !Task.isCancelled else { return }
             draft = result
         }

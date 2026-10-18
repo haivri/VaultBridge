@@ -65,9 +65,11 @@ server, a clean working copy, and hydrated attachments. Offline saves remain
 local; automatic retries back off. iOS controls when background work can run.
 
 Conflicts open the actual files from the main screen. Compare phone and server
-versions, see differing Obsidian settings, choose a copy or combine edits, then
+versions, see differing Obsidian settings, choose a copy or **Merge into one file**, then
 **Save and finish syncing**. Both histories remain protected. A choice cannot
-silently overwrite edits made while its preview was open.
+silently overwrite edits made while its preview was open. Single-file merging uses
+the shared ancestor to include independent edits and asks for a choice where edits
+overlap. Creating two separate files is a distinct, explicitly labeled action.
 
 Recently received files that disappear or revert, and unusually large deletion
 batches, pause for review. Restore the protected files or approve the exact
