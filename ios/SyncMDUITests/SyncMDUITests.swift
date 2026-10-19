@@ -1,6 +1,41 @@
 import XCTest
 
 final class SyncMDUITests: XCTestCase {
+    func testOneFileDefaultAndSavedSeparateFilesPreference() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-SyncSafetyUITest", "-SyncNoteConflictUITest"]
+        app.launch()
+        let next = app.buttons["vault.nextAction"]
+        if !next.waitForExistence(timeout: 5) {
+            let open = app.buttons["Review"].firstMatch
+            XCTAssertTrue(open.waitForExistence(timeout: 20)); open.tap()
+        }
+        XCTAssertTrue(next.waitForExistence(timeout: 10)); next.tap()
+        let merge = app.buttons["conflict.mergeOneFile"]
+        XCTAssertTrue(merge.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["conflict.keepSeparateFiles"].exists)
+        app.buttons["Done for now"].tap()
+
+        app.buttons["vault.settings"].tap()
+        let picker = app.buttons["settings.conflictFilePreference"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 10))
+        picker.tap()
+        app.buttons["Keep two separate files"].tap()
+        app.buttons["Save"].tap()
+        XCTAssertTrue(next.waitForExistence(timeout: 10))
+        app.buttons["vault.settings"].tap()
+        XCTAssertTrue(picker.waitForExistence(timeout: 10))
+        XCTAssertTrue(picker.label.contains("Keep two separate files"))
+        app.buttons["Cancel"].tap()
+        next.tap()
+        let separate = app.buttons["conflict.keepSeparateFiles"]
+        XCTAssertTrue(separate.waitForExistence(timeout: 10))
+        XCTAssertTrue(merge.exists)
+        XCTAssertLessThan(separate.frame.minY, merge.frame.minY)
+        separate.tap()
+        XCTAssertTrue(app.staticTexts["Your choices are saved"].waitForExistence(timeout: 10))
+    }
+
     func testGuidedConflictReviewFinishesWithoutGitTools() {
         let app = XCUIApplication()
         app.launchArguments = ["-SyncSafetyUITest"]

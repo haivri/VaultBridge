@@ -118,6 +118,7 @@ final class RepoPersistenceStore: @unchecked Sendable {
         if original.gitHubAccountLogin != modified.gitHubAccountLogin { merged.gitHubAccountLogin = modified.gitHubAccountLogin }
         if original.autoSyncEnabled != modified.autoSyncEnabled { merged.autoSyncEnabled = modified.autoSyncEnabled }
         if original.syncNotificationsEnabled != modified.syncNotificationsEnabled { merged.syncNotificationsEnabled = modified.syncNotificationsEnabled }
+        if original.conflictFilePreference != modified.conflictFilePreference { merged.conflictFilePreference = modified.conflictFilePreference }
         if original.gitState.commitSHA != modified.gitState.commitSHA { merged.gitState.commitSHA = modified.gitState.commitSHA }
         if original.gitState.treeSHA != modified.gitState.treeSHA { merged.gitState.treeSHA = modified.gitState.treeSHA }
         if original.gitState.branch != modified.gitState.branch { merged.gitState.branch = modified.gitState.branch }

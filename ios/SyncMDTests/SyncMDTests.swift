@@ -893,6 +893,38 @@ final class SyncMDTests: XCTestCase {
         #endif
     }
 
+    func testConflictFilePreferenceDefaultsToOneFileForNewLegacyAndUnknownRecords() throws {
+        let repo = RepoConfig(repoURL: "one/repo", branch: "main", authorName: "One", authorEmail: "one@example.com", vaultFolderName: "one")
+        XCTAssertEqual(repo.conflictFilePreference, .mergeIntoOriginal)
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(repo)) as? [String: Any])
+        for value: String? in [nil, "futurePreference"] {
+            json["conflictFilePreference"] = value
+            let decoded = try JSONDecoder().decode(RepoConfig.self, from: JSONSerialization.data(withJSONObject: json))
+            XCTAssertEqual(decoded.conflictFilePreference, .mergeIntoOriginal)
+        }
+    }
+
+    func testConflictFilePreferenceSurvivesPersistenceAndConcurrentSyncUpdate() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("merge-preference-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let store = RepoPersistenceStore()
+        let original = RepoConfig(repoURL: "one/repo", branch: "main", authorName: "One", authorEmail: "one@example.com", vaultFolderName: "one")
+        try store.apply([.add(original)], to: file)
+        var settings = original
+        settings.conflictFilePreference = .keepSeparateFiles
+        try store.apply([.update(original: original, modified: settings)], to: file)
+        var sync = original
+        sync.gitState.commitSHA = "new-commit"
+        try store.apply([.update(original: original, modified: sync)], to: file)
+        let loaded = try XCTUnwrap(store.loadStrict(from: file).first)
+        XCTAssertEqual(loaded.conflictFilePreference, .keepSeparateFiles)
+        XCTAssertEqual(loaded.gitState.commitSHA, "new-commit")
+        var restored = loaded
+        restored.conflictFilePreference = .mergeIntoOriginal
+        try store.apply([.update(original: loaded, modified: restored)], to: file)
+        XCTAssertEqual(try store.loadStrict(from: file).first?.conflictFilePreference, .mergeIntoOriginal)
+    }
+
     func testRepoConfigLegacyDecodeDefaultsAssistDisabled() throws {
         let repo = RepoConfig(repoURL: "one/repo", branch: "main", authorName: "One", authorEmail: "one@example.com", vaultFolderName: "one")
         var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(repo)) as? [String: Any])

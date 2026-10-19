@@ -13,6 +13,10 @@ struct ConflictReviewView: View {
     @State private var pendingChoice: ConflictFileDetail?
     @State private var pendingStrategy: ConflictResolutionStrategy = .ours
 
+    private var prefersSeparateFiles: Bool {
+        state.repo(id: repoID)?.conflictFilePreference == .keepSeparateFiles
+    }
+
     var body: some View {
         List {
             Section {
@@ -36,6 +40,9 @@ struct ConflictReviewView: View {
                     ConflictComparisonView(detail: detail)
                     version(detail.ours, title: "Full iPhone original")
                     version(detail.theirs, title: "Full server original")
+                    if prefersSeparateFiles && canKeepSeparateFiles(detail) {
+                        separateFilesAction(detail)
+                    }
                     if !detail.isRenameRename,
                        detail.ours?.isBinary == false, detail.theirs?.isBinary == false,
                        let phone = detail.ours?.content, let server = detail.theirs?.content,
@@ -51,19 +58,9 @@ struct ConflictReviewView: View {
                         if detail.ours?.isBinary != true && detail.theirs?.isBinary != true {
                             NavigationLink("Edit combined text manually", value: ConflictEditorDestination(repoID: repoID, path: detail.lookupPath))
                         }
-                        if detail.ours?.content != nil && detail.theirs?.content != nil && !detail.lookupPath.hasPrefix(".obsidian/") {
+                        if !prefersSeparateFiles && canKeepSeparateFiles(detail) {
                             DisclosureGroup("Keep originals as two separate files") {
-                                Text("This creates an extra server copy. To combine the text in the original file, use Merge into one file.")
-                                    .font(.caption).foregroundStyle(.secondary)
-                                Button("Create two separate files") {
-                                    busy = true
-                                    Task {
-                                        let name = URL(fileURLWithPath: detail.theirs!.path)
-                                        let relative = (detail.theirs!.path as NSString).deletingPathExtension + " (Server copy \(UUID().uuidString.prefix(8)))" + (name.pathExtension.isEmpty ? "" : "." + name.pathExtension)
-                                        _ = await state.resolveConflictKeepingBoth(repoID: repoID, detail: detail, serverCopyPath: relative)
-                                        await reload(); busy = false
-                                    }
-                                }
+                                separateFilesAction(detail)
                             }
                         }
                     }
@@ -124,6 +121,27 @@ struct ConflictReviewView: View {
         }
         .task { await reload() }
         .onChange(of: state.conflictSessionByRepo[repoID]) { Task { await reload() } }
+    }
+
+    private func canKeepSeparateFiles(_ detail: ConflictFileDetail) -> Bool {
+        !detail.isRenameRename && detail.ours?.content != nil && detail.theirs?.content != nil
+            && !detail.lookupPath.hasPrefix(".obsidian/")
+    }
+
+    @ViewBuilder private func separateFilesAction(_ detail: ConflictFileDetail) -> some View {
+        Text("This creates an extra server copy. To combine the text in the original file, use Merge into one file.")
+            .font(.caption).foregroundStyle(.secondary)
+        Button("Create two separate files") {
+            guard let server = detail.theirs else { return }
+            busy = true
+            Task {
+                let name = URL(fileURLWithPath: server.path)
+                let relative = (server.path as NSString).deletingPathExtension + " (Server copy \(UUID().uuidString.prefix(8)))" + (name.pathExtension.isEmpty ? "" : "." + name.pathExtension)
+                _ = await state.resolveConflictKeepingBoth(repoID: repoID, detail: detail, serverCopyPath: relative)
+                await reload(); busy = false
+            }
+        }
+        .accessibilityIdentifier("conflict.keepSeparateFiles")
     }
 
     @ViewBuilder private func version(_ side: ConflictFileSide?, title: String) -> some View {

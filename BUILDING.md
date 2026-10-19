@@ -59,3 +59,16 @@ editable merge choices, saving, and recovery without an upload.
 The Release iPhone build passed, its signature was verified, and version 1.1.3
 was installed in place with the existing app identity and valid ad hoc profile.
 The live vault was not used as a test fixture.
+
+## 1.1.4 merge preference validation (2026-10-18)
+
+The signed simulator suite passed all 216 unit/integration tests and all four
+UI tests. Coverage includes the disposable-remote single-file merge round trip,
+legacy/unknown preference defaults, and preference persistence across concurrent
+sync metadata updates. The UI test verified the default single-file action,
+changing and reopening the saved preference, and explicitly creating separate
+files from the preferred action. Existing merge and recovery UI tests passed.
+
+The Release iPhone build passed and its signature was verified with the existing
+valid ad hoc profile. Version 1.1.4 was installed in place using the existing app
+identity. The live vault was not used as a test fixture.

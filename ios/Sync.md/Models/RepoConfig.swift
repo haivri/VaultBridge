@@ -1,5 +1,18 @@
 import Foundation
 
+/// Selects the primary review action; never resolves conflicts automatically.
+enum ConflictFilePreference: String, Codable, CaseIterable {
+    case mergeIntoOriginal
+    case keepSeparateFiles
+
+    var title: String {
+        switch self {
+        case .mergeIntoOriginal: "Merge into one file"
+        case .keepSeparateFiles: "Keep two separate files"
+        }
+    }
+}
+
 /// Configuration and state for a single managed repository
 struct RepoConfig: Codable, Identifiable, Equatable {
     let id: UUID
@@ -25,6 +38,7 @@ struct RepoConfig: Codable, Identifiable, Equatable {
     /// Local notifications for meaningful automatic-sync outcomes. This is
     /// intentionally opt-in because iOS notification permission is app-wide.
     var syncNotificationsEnabled: Bool
+    var conflictFilePreference: ConflictFilePreference
     /// Optional Premium automation policy. Defaults disabled for legacy records.
     var assist: RepoAssistSettings
 
@@ -43,6 +57,7 @@ struct RepoConfig: Codable, Identifiable, Equatable {
         gitState: GitState = .empty,
         autoSyncEnabled: Bool = true,
         syncNotificationsEnabled: Bool = false,
+        conflictFilePreference: ConflictFilePreference = .mergeIntoOriginal,
         assist: RepoAssistSettings = .disabled
     ) {
         self.id = id
@@ -65,12 +80,14 @@ struct RepoConfig: Codable, Identifiable, Equatable {
         self.gitState = gitState
         self.autoSyncEnabled = autoSyncEnabled
         self.syncNotificationsEnabled = syncNotificationsEnabled
+        self.conflictFilePreference = conflictFilePreference
         self.assist = assist
     }
 
     // MARK: - Codable (backward-compatible)
 
     private enum CodingKeys: String, CodingKey {
+        case conflictFilePreference
         case id, repoURL, branch, authorName, authorEmail
         case vaultFolderName, customVaultBookmarkData
         case customLocationIsParent, authMethod, authUsername, gitHubAccountLogin, gitState, autoSyncEnabled, syncNotificationsEnabled, assist
@@ -98,6 +115,8 @@ struct RepoConfig: Codable, Identifiable, Equatable {
         gitState                = try c.decode(GitState.self, forKey: .gitState)
         autoSyncEnabled         = try c.decodeIfPresent(Bool.self, forKey: .autoSyncEnabled) ?? true
         syncNotificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .syncNotificationsEnabled) ?? false
+        let preference = try c.decodeIfPresent(String.self, forKey: .conflictFilePreference)
+        conflictFilePreference = preference.flatMap(ConflictFilePreference.init(rawValue:)) ?? .mergeIntoOriginal
         assist                  = try c.decodeIfPresent(RepoAssistSettings.self, forKey: .assist) ?? .disabled
     }
 

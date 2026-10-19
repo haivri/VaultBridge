@@ -18,6 +18,7 @@ struct VaultBridgeRepoSettingsView: View {
     @State private var passphrase = ""
     @State private var autoSyncEnabled = true
     @State private var syncNotificationsEnabled = false
+    @State private var conflictFilePreference: ConflictFilePreference = .mergeIntoOriginal
     @State private var notificationPermissionDenied = false
     @State private var saving = false
     @State private var showRemoveConfirmation = false
@@ -45,6 +46,19 @@ struct VaultBridgeRepoSettingsView: View {
                     Text("Notifications are sent only when an automatic sync moves changes or needs your attention. Clean checks stay silent.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+
+                Section("Conflict Review") {
+                    Picker("Preferred result", selection: $conflictFilePreference) {
+                        ForEach(ConflictFilePreference.allCases, id: \.self) { preference in
+                            Text(preference.title).tag(preference)
+                        }
+                    }
+                    .accessibilityIdentifier("settings.conflictFilePreference")
+                    Text("Merge into one file combines edits in the original file. Keep two separate files offers an extra server copy first. You still review and save each conflict; this setting never resolves conflicts automatically.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("Separate copies are available only when both originals exist at the same path, outside Obsidian settings.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section("Repository") {
@@ -147,6 +161,7 @@ struct VaultBridgeRepoSettingsView: View {
         authMethod = repo.authMethod
         autoSyncEnabled = repo.autoSyncEnabled
         syncNotificationsEnabled = repo.syncNotificationsEnabled
+        conflictFilePreference = repo.conflictFilePreference
         // Only surface the per-repo secrets that this repo's method actually
         // edits. A `.gitHubPAT` repo resolves to the account-wide OAuth/PAT
         // token; loading it into these fields would expose it if the user
@@ -190,6 +205,7 @@ struct VaultBridgeRepoSettingsView: View {
             state.updateRepo(id: repoID) {
                 $0.autoSyncEnabled = autoSyncEnabled
                 $0.syncNotificationsEnabled = autoSyncEnabled && syncNotificationsEnabled
+                $0.conflictFilePreference = conflictFilePreference
             }
             dismiss()
         }

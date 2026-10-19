@@ -69,7 +69,11 @@ versions, see differing Obsidian settings, choose a copy or **Merge into one fil
 **Save and finish syncing**. Both histories remain protected. A choice cannot
 silently overwrite edits made while its preview was open. Single-file merging uses
 the shared ancestor to include independent edits and asks for a choice where edits
-overlap. Creating two separate files is a distinct, explicitly labeled action.
+overlap. **Vault Settings → Conflict Review → Preferred result** defaults to
+**Merge into one file**. Choose **Keep two separate files** to offer a separate
+server copy first for eligible conflicts. This preference changes the primary
+review action; it never resolves a conflict automatically. Creating two separate
+files remains a distinct, explicitly labeled action.
 
 Recently received files that disappear or revert, and unusually large deletion
 batches, pause for review. Restore the protected files or approve the exact

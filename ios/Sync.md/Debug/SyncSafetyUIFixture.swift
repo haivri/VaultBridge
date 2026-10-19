@@ -18,7 +18,8 @@ enum SyncSafetyUIFixture {
         git_repository_free(raw)
         let service = LocalGitService(localURL: root)
         try await service.setRemoteURL(name: "origin", url: remote.path)
-        let settings = root.appendingPathComponent(".obsidian/app.json")
+        let conflictPath = ProcessInfo.processInfo.arguments.contains("-SyncNoteConflictUITest") ? "Note.md" : ".obsidian/app.json"
+        let settings = root.appendingPathComponent(conflictPath)
         try Data("{\"fontSize\":16}\n".utf8).write(to: settings)
         try await service.stageAll()
         _ = try await service.commitLocal(message: "Initial settings", authorName: "Example", authorEmail: "example@example.invalid")

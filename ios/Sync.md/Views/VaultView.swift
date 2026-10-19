@@ -76,6 +76,8 @@ struct VaultView: View {
                         .frame(width: 32, height: 32)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Vault Settings")
+                .accessibilityIdentifier("vault.settings")
             }
         }
         .sheet(isPresented: $showCommitSheet) { GitControlSheet(repoID: repoID) }

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.4
+
+- Add a per-vault Conflict Review preference, defaulting to merging into the original file.
+- Offer two separate files first only when selected; every conflict still requires review and an explicit save.
+- Preserve the preference across upgrades and concurrent sync metadata updates.
+
 ## 1.1.3
 
 - Merge edits into one original file using the shared ancestor, preserving independent additions, task updates, and journal entries.
