@@ -45,6 +45,29 @@ enum VaultBridgeSyncPhase: String, Codable, Sendable {
     case complete
     case attention
     case failed
+
+    /// These are workflow stages, not a transfer percentage or time estimate.
+    var stage: (number: Int, title: String)? {
+        switch self {
+        case .inspecting: (1, "Check this iPhone")
+        case .committing: (2, "Save on this iPhone")
+        case .fetching, .comparing, .reconciling, .pulling: (3, "Get and combine server updates")
+        case .pushing: (4, "Upload saved work")
+        case .verifying: (5, "Verify files and attachments")
+        default: nil
+        }
+    }
+
+    var activity: String {
+        switch self {
+        case .fetching: "Checking the server"
+        case .comparing: "Comparing phone and server"
+        case .reconciling: "Combining phone and server changes"
+        case .pulling: "Bringing server changes onto this phone"
+        default: stage?.title ?? "Ready"
+        }
+    }
+
 }
 
 struct VaultBridgeSyncStatus: Equatable, Sendable {
@@ -392,7 +415,10 @@ final class VaultBridgeSyncCoordinator {
             guard await state.pullWithMerge(
                 repoID: repoID,
                 presentsErrors: !automatic,
-                refreshStatus: false
+                refreshStatus: false,
+                onPhase: { phase in
+                    await self.update(repo: repo, phase: phase, message: phase.activity)
+                }
             ) else {
                 let outcome = state.pullOutcomeByRepo[repoID]
                 let needsAttention = outcome?.kind == .mergeConflicts
@@ -409,12 +435,8 @@ final class VaultBridgeSyncCoordinator {
                 return
             }
 
-            await update(repo: repo, phase: .comparing, message: "Comparing phone and server")
             state.markVaultBridgeRemoteCheckSucceeded(repoID: repoID)
             let pullKind = state.pullOutcomeByRepo[repoID]?.kind
-            if pullKind == .merged || pullKind == .fastForwarded {
-                await update(repo: repo, phase: .reconciling, message: "Bringing server changes onto this phone")
-            }
             let localHasCommits = !(state.repo(id: repoID)?.gitState.commitSHA ?? "").isEmpty
             let shouldPush: Bool
             switch pullKind {
@@ -519,6 +541,13 @@ final class VaultBridgeSyncCoordinator {
     private func update(repo: RepoConfig, phase: VaultBridgeSyncPhase, message: String, retrySuggested: Bool = false, verifiedAt: Date? = nil) async {
         let now = Date()
         statusByRepo[repo.id] = VaultBridgeSyncStatus(phase: phase, message: message, date: verifiedAt ?? now, retrySuggested: retrySuggested)
+        #if DEBUG
+        // Give UI tests time to observe real stage transitions in the disposable vault.
+        if ProcessInfo.processInfo.arguments.contains("-SyncSafetyUITest"),
+           ProcessInfo.processInfo.arguments.contains("-SyncProgressUITest"), phase.stage != nil {
+            try? await Task.sleep(for: .seconds(phase == .verifying ? 3 : 1))
+        }
+        #endif
         await VaultBridgeSyncJournal.shared.record(.init(
             repoID: repo.id,
             repoName: repo.displayName,

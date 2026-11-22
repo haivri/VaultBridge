@@ -1058,8 +1058,12 @@ final class AppState {
                 if !isStale {
                     if let index = repoIndex(id: repoID) {
                         var shouldPersist = false
-                        if !info.remoteCommitSHA.isEmpty,
-                           repos[index].gitState.remoteCommitSHA != info.remoteCommitSHA {
+                        if repos[index].gitState.commitSHA != info.commitSHA || repos[index].gitState.branch != info.branch {
+                            repos[index].gitState.commitSHA = info.commitSHA
+                            repos[index].gitState.branch = info.branch
+                            shouldPersist = true
+                        }
+                        if repos[index].gitState.remoteCommitSHA != info.remoteCommitSHA {
                             repos[index].gitState.remoteCommitSHA = info.remoteCommitSHA
                             shouldPersist = true
                         }
@@ -1115,6 +1119,10 @@ final class AppState {
 
     func markRepositoryInspectionCompleted(repoID: UUID, at date: Date = Date()) {
         lastRepositoryInspectionCompletedAt[repoID] = date
+    }
+
+    func lastRepositoryInspectionDate(repoID: UUID) -> Date? {
+        lastRepositoryInspectionCompletedAt[repoID]
     }
 
     func repositoryInspectionIsFresh(
@@ -2484,6 +2492,7 @@ final class AppState {
             markRepositoryMutated(repoID: repoID)
             if let currentIndex = repoIndex(id: repoID) {
                 repos[currentIndex].gitState.commitSHA = result.newCommitSHA
+                repos[currentIndex].gitState.localCheckpointDate = Date()
                 repos[currentIndex].gitState.lastSyncDate = Date()
                 saveRepos()
                 clearCommitHistoryCache(for: repoID)
@@ -3171,7 +3180,8 @@ final class AppState {
     func pullWithMerge(
         repoID: UUID,
         presentsErrors: Bool = true,
-        refreshStatus: Bool = true
+        refreshStatus: Bool = true,
+        onPhase: (@Sendable (VaultBridgeSyncPhase) async -> Void)? = nil
     ) async -> Bool {
         guard let repo = repo(id: repoID) else {
             showError(message: String(localized: "Repository not found"))
@@ -3199,15 +3209,19 @@ final class AppState {
             let serialized = try serializedRepository(repoID: repoID)
             let execution: MergePullExecution = try await serialized.withLease { repository in
                 guard repository.hasGitDirectory else { throw LocalGitError.notCloned }
+                await onPhase?(.fetching)
                 let plan = try await repository.pullPlan(pat: credentials)
+                await onPhase?(.comparing)
                 switch plan.action {
                 case .fastForward:
+                    await onPhase?(.pulling)
                     let result = try await repository.pullFastForward(branch: plan.branch, pat: credentials)
                     return MergePullExecution(plan: plan, fastForward: result, merge: nil)
                 case .diverged:
                     guard !authorName.isEmpty, !authorEmail.isEmpty else {
                         throw LocalGitError.invalidAuthorIdentity("Set a Git author name and email for \(repo.displayName) before combining phone and server changes.")
                     }
+                    await onPhase?(.reconciling)
                     let merge = try await repository.mergeBranch(
                         name: "origin/\(plan.branch)",
                         authorName: authorName,

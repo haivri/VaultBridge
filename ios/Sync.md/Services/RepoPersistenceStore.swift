@@ -124,6 +124,11 @@ final class RepoPersistenceStore: @unchecked Sendable {
         if original.gitState.branch != modified.gitState.branch { merged.gitState.branch = modified.gitState.branch }
         if original.gitState.blobSHAs != modified.gitState.blobSHAs { merged.gitState.blobSHAs = modified.gitState.blobSHAs }
         if original.gitState.lastSyncDate != modified.gitState.lastSyncDate { merged.gitState.lastSyncDate = modified.gitState.lastSyncDate }
+        if original.gitState.remoteCommitSHA != modified.gitState.remoteCommitSHA { merged.gitState.remoteCommitSHA = modified.gitState.remoteCommitSHA }
+        if original.gitState.lastRemoteCheckDate != modified.gitState.lastRemoteCheckDate { merged.gitState.lastRemoteCheckDate = modified.gitState.lastRemoteCheckDate }
+        if original.gitState.localCheckpointDate != modified.gitState.localCheckpointDate { merged.gitState.localCheckpointDate = modified.gitState.localCheckpointDate }
+        if original.gitState.verifiedCommitSHA != modified.gitState.verifiedCommitSHA { merged.gitState.verifiedCommitSHA = modified.gitState.verifiedCommitSHA }
+        if original.gitState.lastVerifiedDate != modified.gitState.lastVerifiedDate { merged.gitState.lastVerifiedDate = modified.gitState.lastVerifiedDate }
         if original.assist.enabled != modified.assist.enabled { merged.assist.enabled = modified.assist.enabled }
         if original.assist.channel != modified.assist.channel { merged.assist.channel = modified.assist.channel }
         if original.assist.selectedBranch != modified.assist.selectedBranch { merged.assist.selectedBranch = modified.assist.selectedBranch }

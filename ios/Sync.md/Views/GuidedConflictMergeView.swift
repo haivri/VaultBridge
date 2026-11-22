@@ -10,25 +10,61 @@ struct GuidedConflictMergeView: View {
     @State private var choices: [Int: ConflictMergeDraft.Choice] = [:]
     @State private var saving = false
 
+    private func versionCard(_ lines: [String], side: ConflictMergeDraft.Choice, block: ConflictMergeDraft.Block) -> some View {
+        let selected = choices[block.id] == side || choices[block.id] == .both
+        return Button {
+            choices[block.id] = ConflictMergeDraft.Choice.toggling(side, in: choices[block.id])
+        } label: {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text(side.rawValue).font(.headline)
+                    Spacer()
+                    Label(selected ? "Keep" : "Tap to keep", systemImage: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(selected ? Color.accentColor : .secondary)
+                }
+                if lines.isEmpty {
+                    Text("No lines here — keep this deletion").font(.callout).foregroundStyle(.secondary)
+                } else {
+                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                        VStack(alignment: .leading, spacing: 3) {
+                            if let task = MarkdownTaskLine(line) {
+                                Label(task.statusLabel, systemImage: task.isCompleted ? "checkmark.square" : "square")
+                                    .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                            }
+                            Text(line.isEmpty ? " " : line).font(.callout.monospaced())
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? Color.accentColor.opacity(0.10) : Color(.secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(selected ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: selected ? 2 : 1))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("merge.version.\(block.id).\(side == .phone ? "phone" : "server")")
+        .accessibilityValue(selected ? "Selected" : "Not selected")
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .accessibilityHint("Double tap to \(selected ? "remove" : "keep") this version. Selecting both keeps both copies.")
+    }
+
     var body: some View {
         List {
             Section {
-                Text("Combine edits in the original file. Changes made on only one side are included using the shared earlier version. If both sides changed the same text, choose what to keep below.")
-                Text("Both keeps both alternatives inside this file; review them for duplicates. Saving does not create a second file.").font(.caption).foregroundStyle(.secondary)
+                Text("Combine edits in the original file. Changes made on only one side are included using the shared earlier version. Tap the version you want to keep for each overlapping change.")
+                Text("Tap both versions to keep both, or tap a selected version to remove it. Your choices stay editable until you save.").font(.caption).foregroundStyle(.secondary)
             }
             if let draft {
                 ForEach(Array(draft.changes.enumerated()), id: \.element.id) { index, block in
                     Section("Change \(index + 1) of \(draft.changes.count)") {
-                        Text("iPhone").font(.headline)
-                        Text(block.phone.isEmpty ? "No lines here" : block.phone.joined(separator: "\n")).font(.callout.monospaced()).textSelection(.enabled)
-                        Text("Server").font(.headline)
-                        Text(block.server.isEmpty ? "No lines here" : block.server.joined(separator: "\n")).font(.callout.monospaced()).textSelection(.enabled)
-                        ForEach(ConflictMergeDraft.Choice.allCases, id: \.self) { choice in
-                            Button {
-                                choices[block.id] = choice
-                            } label: {
-                                Label("Keep \(choice.rawValue)", systemImage: choices[block.id] == choice ? "checkmark.circle.fill" : "circle")
-                            }
+                        versionCard(block.phone, side: .phone, block: block)
+                        versionCard(block.server, side: .server, block: block)
+                        if choices[block.id] == .both {
+                            Label("Both versions selected. Both copies will be kept; check for duplicate tasks or text in the preview.", systemImage: "doc.on.doc")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -40,7 +76,7 @@ struct GuidedConflictMergeView: View {
                     }
                     if let result = draft.result(choices: choices) {
                         DisclosureGroup("Preview complete result") {
-                            Text(result).font(.callout.monospaced()).textSelection(.enabled)
+                            Text(result).font(.callout.monospaced()).textSelection(.enabled).accessibilityIdentifier("merge.result")
                         }
                         Button("Save merged file") {
                             saving = true

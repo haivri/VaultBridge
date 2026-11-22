@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.0
+
+- Select iPhone, Server, or both by tapping version cards; revise choices before saving.
+- Review neighboring checkbox changes individually and display task states explicitly.
+- Recognize task completion without treating it as lost text; retain protection for reopened tasks and missing timestamps.
+- Preserve save and verification timestamps across persistence updates and reloads.
+- Replace Git details with live, plain-language sync details and optional commit identifiers.
+- Show actual sync stages and final verification; refresh local file status while the vault screen is active.
+
+## 1.2.0
+
+- Keep incoming-note protection across unrelated syncs and restarts.
+- Review missing protected text and selectively restore note history while keeping newer edits.
+- Display separate local-save and server-verification times.
+
 ## 1.1.4
 
 - Add a per-vault Conflict Review preference, defaulting to merging into the original file.

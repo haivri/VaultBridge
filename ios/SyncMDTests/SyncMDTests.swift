@@ -162,6 +162,73 @@ final class SyncMDTests: XCTestCase {
         XCTAssertEqual(commit.parentOIDs.count, 2)
     }
 
+    func testTaskCheckboxesAreIndependentAndKeepExactFormatting() {
+        let phone = "# Tasks\n  - [x] Stretch\r\n  - [ ] Walk\r\n1. [/] Plan\n"
+        let server = "# Tasks\n  - [ ] Stretch\r\n  - [X] Walk\r\n1. [-] Plan\n"
+        let draft = ConflictMergeDraft(phone: phone, server: server)
+        XCTAssertEqual(draft.changes.count, 3)
+        let ids = draft.changes.map(\.id)
+        XCTAssertEqual(draft.result(choices: [ids[0]: .phone, ids[1]: .server, ids[2]: .phone]),
+                       "# Tasks\n  - [x] Stretch\r\n  - [X] Walk\r\n1. [/] Plan\n")
+        XCTAssertEqual(draft.result(choices: Dictionary(uniqueKeysWithValues: ids.map { ($0, .phone) })), phone)
+        XCTAssertEqual(draft.result(choices: Dictionary(uniqueKeysWithValues: ids.map { ($0, .server) })), server)
+    }
+
+    func testAdjacentCheckboxEditsMergeByTaskAndConflictingStatesStayExplicit() {
+        let base = "- [ ] Stretch\n- [ ] Walk\n- [ ] Plan"
+        let draft = ConflictMergeDraft(phone: "- [x] Stretch\n- [x] Walk\n- [ ] Plan",
+                                       server: "- [ ] Stretch\n- [X] Walk\n- [x] Plan", ancestor: base)
+        // x and X are preserved exactly; different originals require review.
+        XCTAssertEqual(draft.changes.count, 1)
+        XCTAssertEqual(draft.changes[0].phone, ["- [x] Walk"])
+        XCTAssertEqual(draft.result(choices: [draft.changes[0].id: .phone]), "- [x] Stretch\n- [x] Walk\n- [x] Plan")
+        let reopened = ConflictMergeDraft(phone: "- [ ] Walk", server: "- [-] Walk", ancestor: "- [x] Walk")
+        XCTAssertNil(reopened.result(choices: [:]))
+    }
+
+    func testTaskAlignmentPreservesRepeatedDeletedAndRenamedTasks() {
+        for pair in [("- [ ] A\n- [ ] A", "- [x] A"),
+                     ("- [ ] A\n- [x] B", "- [x] B\n- [ ] A"),
+                     ("- [ ] A", "- [x] Renamed"),
+                     ("- [ ] A\nold prose", "- [x] A\nnew prose")] {
+            let draft = ConflictMergeDraft(phone: pair.0, server: pair.1)
+            XCTAssertEqual(draft.result(choices: Dictionary(uniqueKeysWithValues: draft.changes.map { ($0.id, .phone) })), pair.0)
+            XCTAssertEqual(draft.result(choices: Dictionary(uniqueKeysWithValues: draft.changes.map { ($0.id, .server) })), pair.1)
+        }
+    }
+
+    func testProtectedTaskCompletionAllowsCheckButReviewsLostTextOrReopening() {
+        XCTAssertTrue(ProtectedNoteText.missing(expected: "- [ ] A\n  1. [ ] B", current: "- [x] A\n  1. [X] B").isEmpty)
+        XCTAssertTrue(ProtectedNoteText.missing(expected: "- [x] A", current: "- [X] A").isEmpty)
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "- [x] A", current: "- [ ] A"), ["- [x] A"])
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "- [ ] A at 12:00", current: "- [x] A"), ["- [ ] A at 12:00"])
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "- [ ] A\n- [x] A", current: "- [x] A"), ["- [ ] A"])
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "- [ ] A\n- [ ] A", current: "- [x] A"), ["- [ ] A"])
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "- [/] A", current: "- [-] A"), ["- [/] A"])
+    }
+
+    func testTapSelectionSupportsEitherBothAndDeselecting() {
+        typealias Choice = ConflictMergeDraft.Choice
+        var choice = Choice.toggling(.phone, in: nil)
+        XCTAssertEqual(choice, .phone)
+        choice = Choice.toggling(.server, in: choice)
+        XCTAssertEqual(choice, .both)
+        choice = Choice.toggling(.phone, in: choice)
+        XCTAssertEqual(choice, .server)
+        choice = Choice.toggling(.server, in: choice)
+        XCTAssertNil(choice)
+    }
+
+    func testSyncStagesDoNotClaimCompletionForVerificationOrErrors() {
+        XCTAssertEqual(VaultBridgeSyncPhase.fetching.stage?.number, 3)
+        XCTAssertEqual(VaultBridgeSyncPhase.pulling.stage?.number, 3)
+        XCTAssertEqual(VaultBridgeSyncPhase.pushing.stage?.number, 4)
+        XCTAssertEqual(VaultBridgeSyncPhase.verifying.stage?.number, 5)
+        for phase in [VaultBridgeSyncPhase.idle, .attention, .failed, .complete] {
+            XCTAssertNil(phase.stage)
+        }
+    }
+
     func testSmoke() {
         XCTAssertTrue(true)
     }
@@ -586,6 +653,36 @@ final class SyncMDTests: XCTestCase {
         XCTAssertEqual(persisted.first?.branch, "notes")
         XCTAssertEqual(persisted.first?.autoSyncEnabled, false)
         XCTAssertEqual(persisted.first?.syncNotificationsEnabled, true)
+    }
+
+    func testSyncProofSurvivesConcurrentSettingsUpdatesAndReload() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("sync-proof-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = RepoPersistenceStore()
+        let original = RepoConfig(repoURL: "https://example.invalid/notes.git", branch: "main", authorName: "Test", authorEmail: "test@example.invalid", vaultFolderName: "notes")
+        try store.replaceAll([original], at: fileURL)
+        var saved = original
+        saved.gitState.commitSHA = String(repeating: "a", count: 40)
+        saved.gitState.remoteCommitSHA = saved.gitState.commitSHA
+        saved.gitState.verifiedCommitSHA = saved.gitState.commitSHA
+        saved.gitState.localCheckpointDate = Date(timeIntervalSince1970: 100)
+        saved.gitState.lastRemoteCheckDate = Date(timeIntervalSince1970: 200)
+        saved.gitState.lastVerifiedDate = Date(timeIntervalSince1970: 201)
+        _ = try store.apply([.update(original: original, modified: saved)], to: fileURL)
+        var settings = original
+        settings.autoSyncEnabled = !original.autoSyncEnabled
+        _ = try store.apply([.update(original: original, modified: settings)], to: fileURL)
+        let reloaded = try XCTUnwrap(store.loadStrict(from: fileURL).first)
+        XCTAssertEqual(reloaded.gitState, saved.gitState)
+        XCTAssertEqual(reloaded.autoSyncEnabled, settings.autoSyncEnabled)
+        var offlineSave = reloaded
+        offlineSave.gitState.commitSHA = String(repeating: "b", count: 40)
+        offlineSave.gitState.localCheckpointDate = Date(timeIntervalSince1970: 300)
+        _ = try store.apply([.update(original: reloaded, modified: offlineSave)], to: fileURL)
+        let later = try XCTUnwrap(store.loadStrict(from: fileURL).first)
+        XCTAssertEqual(later.gitState, offlineSave.gitState)
+        XCTAssertEqual(later.gitState.lastVerifiedDate, saved.gitState.lastVerifiedDate)
+        XCTAssertNotEqual(later.gitState.commitSHA, later.gitState.verifiedCommitSHA)
     }
 
     func testRepoPersistenceStoreMergesSeparateGitStateFields() throws {
@@ -2104,6 +2201,49 @@ final class SyncMDTests: XCTestCase {
         XCTAssertTrue(fixture.repository.stagedPaths.isEmpty)
         XCTAssertEqual(fixture.repository.pullPlanCallCount, 0)
         XCTAssertEqual(fixture.repository.pushCurrentBranchCallCount, 0)
+    }
+
+    @MainActor
+    func testLocalRefreshUpdatesPhoneCommitAndCountsWithoutClaimingServerVerification() async throws {
+        let fixture = try GitFixtureFactory.make(state: .dirty)
+        defer { fixture.cleanup() }
+        let persistence = FileManager.default.temporaryDirectory.appendingPathComponent("refresh-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: persistence) }
+        let state = AppState(gitRepositoryFactory: { _ in fixture.repository }, reposFileURL: persistence, loadPersistedState: false)
+        state.repos = [fixture.repoConfig]
+        let sha = String(repeating: "a", count: 40)
+        fixture.repository.repoInfoResult = LocalRepoInfo(branch: "notes", commitSHA: sha, changeCount: 2, syncState: .ahead)
+        state.detectChanges(repoID: fixture.repoConfig.id)
+        for _ in 0..<100 where state.lastRepositoryInspectionDate(repoID: fixture.repoConfig.id) == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(state.repo(id: fixture.repoConfig.id)?.gitState.commitSHA, sha)
+        XCTAssertEqual(state.repo(id: fixture.repoConfig.id)?.gitState.branch, "notes")
+        XCTAssertEqual(state.changeCounts[fixture.repoConfig.id], 2)
+        XCTAssertNotNil(state.lastRepositoryInspectionDate(repoID: fixture.repoConfig.id))
+        XCTAssertNil(state.repo(id: fixture.repoConfig.id)?.gitState.lastRemoteCheckDate)
+        XCTAssertNil(state.repo(id: fixture.repoConfig.id)?.gitState.lastVerifiedDate)
+        XCTAssertNil(state.repo(id: fixture.repoConfig.id)?.gitState.localCheckpointDate)
+        XCTAssertEqual(fixture.repository.pullPlanCallCount, 0)
+    }
+
+    @MainActor
+    func testPullReportsActualNetworkAndComparePhases() async throws {
+        actor Recorder {
+            var phases: [VaultBridgeSyncPhase] = []
+            func add(_ phase: VaultBridgeSyncPhase) { phases.append(phase) }
+        }
+        let fixture = try GitFixtureFactory.make(state: .clean)
+        defer { fixture.cleanup() }
+        let persistence = FileManager.default.temporaryDirectory.appendingPathComponent("phases-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: persistence) }
+        let state = AppState(gitRepositoryFactory: { _ in fixture.repository }, reposFileURL: persistence, loadPersistedState: false)
+        state.repos = [fixture.repoConfig]
+        let recorder = Recorder()
+        let success = await state.pullWithMerge(repoID: fixture.repoConfig.id, refreshStatus: false, onPhase: { await recorder.add($0) })
+        XCTAssertTrue(success)
+        let phases = await recorder.phases
+        XCTAssertEqual(phases, [.fetching, .comparing])
     }
 
     @MainActor
@@ -7878,6 +8018,18 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
         return pullPlanResult
     }
 
+    private func recordHead(_ sha: String) {
+        guard !sha.isEmpty else { return }
+        repoInfoResult = LocalRepoInfo(branch: repoInfoResult.branch, commitSHA: sha,
+            changeCount: repoInfoResult.changeCount, syncState: repoInfoResult.syncState,
+            statusEntries: repoInfoResult.statusEntries, remoteCommitSHA: repoInfoResult.remoteCommitSHA)
+    }
+
+    private func recordedPull(_ result: LocalPullResult) -> LocalPullResult {
+        if result.updated { recordHead(result.newCommitSHA) }
+        return result
+    }
+
     func pull(pat: String) async throws -> LocalPullResult {
         let plan = try await pullPlan(pat: pat)
         switch plan.action {
@@ -7890,7 +8042,7 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
         case .remoteBranchMissing:
             throw LocalGitError.pullRemoteBranchMissing(plan.branch)
         case .fastForward:
-            return try pullResult.get()
+            return recordedPull(try pullResult.get())
         }
     }
 
@@ -7905,7 +8057,7 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
         switch plan.action {
         case .fastForward:
             pullFastForwardCallCount += 1
-            return PullExecutionResult(plan: plan, pullResult: try pullResult.get())
+            return PullExecutionResult(plan: plan, pullResult: recordedPull(try pullResult.get()))
         case .upToDate, .blockedByLocalChanges, .diverged, .remoteBranchMissing:
             return PullExecutionResult(plan: plan, pullResult: nil)
         }
@@ -7913,14 +8065,14 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
 
     func pullFastForward(branch: String, pat: String) async throws -> LocalPullResult {
         pullFastForwardCallCount += 1
-        return try pullResult.get()
+        return recordedPull(try pullResult.get())
     }
 
     func pullRebase(branch: String, pat: String, authorName: String, authorEmail: String) async throws -> LocalPullResult {
         pullRebaseCallCount += 1
         switch rebaseResult ?? pullResult {
         case .success(let result):
-            return result
+            return recordedPull(result)
         case .failure(let error):
             throw error
         }
@@ -7951,6 +8103,7 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
         operationLog.append("mergeBranch")
         onMergeBranch?(self)
         if let mergeBranchError { throw mergeBranchError }
+        recordHead(mergeResult.newCommitSHA)
         return mergeResult
     }
 
@@ -8038,7 +8191,7 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
         continueRebaseCallCount += 1
         switch continueRebaseResult ?? rebaseResult ?? pullResult {
         case .success(let result):
-            return result
+            return recordedPull(result)
         case .failure(let error):
             throw error
         }
@@ -8150,6 +8303,7 @@ private final class FakeGitRepository: GitRepositoryProtocol, @unchecked Sendabl
         if let commitAndPushResult {
             switch commitAndPushResult {
             case .success(let result):
+                recordHead(result.commitSHA)
                 return result
             case .failure(let error):
                 throw error
@@ -8458,7 +8612,7 @@ extension SyncMDTests {
     func testProtectedTextCountsRepeatedLinesAndIgnoresLineEndingConversion() throws {
         XCTAssertEqual(ProtectedNoteText.missing(expected: "a\na\n🧘\n", current: "a\n🧘"), ["a"])
         XCTAssertEqual(ProtectedNoteText.missing(expected: "a\nb\n", current: "b\r\na"), [])
-        XCTAssertEqual(ProtectedNoteText.missing(expected: "- [ ] shower\n", current: "- [x] shower\n"), ["- [ ] shower"])
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "- [ ] shower\n", current: "- [x] shower\n"), [])
         XCTAssertThrowsError(try ProtectedNoteText.decode(Data([0xff])))
     }
 

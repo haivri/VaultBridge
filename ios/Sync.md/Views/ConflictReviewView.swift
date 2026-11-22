@@ -98,7 +98,9 @@ struct ConflictReviewView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(busy || state.isSyncing)
-                    if coordinator.status(for: repoID).message != "Ready" {
+                    if coordinator.status(for: repoID).isRunning {
+                        VaultSyncProgressView(status: coordinator.status(for: repoID), identifier: "review.syncProgress")
+                    } else if coordinator.status(for: repoID).message != "Ready" {
                         Text(coordinator.status(for: repoID).message).foregroundStyle(.secondary)
                     }
                 }

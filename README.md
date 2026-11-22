@@ -104,8 +104,9 @@ VaultBridge is MIT licensed. Dependencies retain their own licenses; see
 
 Protection now persists per incoming note across unrelated syncs and restarts.
 Removing or replacing protected Markdown text requires review, including a
-missing timestamp alongside another edit. Intentional edits to protected
-checkboxes or sentences can also require approval. The review displays the lost
+missing timestamp alongside another edit. Reopening a received completed task, changing other task states, or editing protected
+sentences can require approval. Checking an otherwise unchanged task is recognized
+as completion and does not trigger a text-loss prompt. The review displays the lost
 text and rejects decisions made against older file or staged versions. Additions,
 line-ending conversion, and reordering unchanged text do not trigger text-loss
 review. Explicitly approved losses do not produce recurring prompts after saving.
@@ -119,7 +120,28 @@ support UTF-8 notes up to 4 MiB and bounded line comparisons. Whole-file recover
 remains available when a selective preview cannot be displayed. Obsidian File
 Recovery snapshots remain separate, in Obsidian's File recovery settings.
 
-The vault and dashboard show **Saved locally at** and **Server verified at** with
-the date and timezone. Offline saves and background activity do not make an old
+The vault’s **Sync details** and the dashboard show local-save and full-verification
+times with the date and timezone. Offline saves and background activity do not make an old
 verification look new. Existing vault configuration and protection records remain
 compatible; missing legacy timestamps are shown as unknown.
+
+## Tappable merge review and live sync status (1.3.0)
+
+Tap the iPhone or Server text card to keep that version. Tap both cards to keep
+both copies, or tap again to deselect. Each matched Markdown task has its own
+choice, including checked, unchecked, and custom task states. Independent edits
+still combine in a preview using the shared ancestor. Overlapping changes require
+choices, and nothing is written until **Save merged file**. Selecting both retains
+both originals verbatim; inspect the result for duplicate tasks.
+
+**Sync details** explains pending local edits, saved versions, local-save time,
+server-check time, full verification, and the latest local inspection. Technical
+commit IDs are available in a secondary disclosure. While the vault screen is
+active and idle, local status is inspected at most once per 15 seconds; this does
+not fetch, upload, or resolve anything. Network checks keep the existing cadence.
+
+During sync, a stage bar shows checking, local saving, getting/combining server
+updates, uploading, and final verification. It reports actual workflow stages,
+not a transfer percentage or a prediction of time remaining. Verification remains
+in progress until files and attachment backups are checked. Interrupted or failed
+runs never display a completed bar.

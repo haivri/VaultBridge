@@ -4,6 +4,7 @@ struct VaultView: View {
     @Environment(AppState.self) private var state
     @Environment(VaultBridgeSyncCoordinator.self) private var syncCoordinator
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     let repoID: UUID
 
     @State private var showSettings = false
@@ -168,6 +169,18 @@ struct VaultView: View {
                 VaultBridgeNotificationRouter.shared.repoID = nil
             }
         }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            // Read-only local inspection while this screen is visible. Network
+            // checks keep their existing cadence and explicit Sync now action.
+            while !Task.isCancelled {
+                if !isBusy {
+                    state.detectChanges(repoID: repoID, skipIfRecentlyStartedWithin: 15)
+                }
+                do { try await Task.sleep(for: .seconds(15)) }
+                catch { return }
+            }
+        }
         .onChange(of: state.repos) {
             if state.repo(id: repoID) == nil { dismiss() }
         }
@@ -185,8 +198,7 @@ struct VaultView: View {
                 if let shelteredEdits {
                     shelteredEditsCard(shelteredEdits)
                 }
-                syncCard
-                Text(repo.gitState.saveStatusTimes).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                TimelineView(.periodic(from: .now, by: 15)) { _ in syncCard }
                 if !statusEntries.isEmpty {
                     changedFilesCard
                 }
@@ -390,7 +402,11 @@ struct VaultView: View {
                     .foregroundStyle(verifiedComplete ? Color.brutalSuccess : .primary)
                     .accessibilityIdentifier("vault.saveStatus")
                 if isBusy {
-                    HStack { ProgressView(); Text(progressText) }
+                    if coordinatorStatus.isRunning {
+                        VaultSyncProgressView(status: coordinatorStatus, identifier: "vault.syncProgress")
+                    } else {
+                        HStack { ProgressView(); Text(progressText) }
+                    }
                 } else {
                     Text(statusExplanation).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
@@ -402,15 +418,20 @@ struct VaultView: View {
                 .controlSize(.large)
                 .disabled(isBusy)
                 .accessibilityIdentifier("vault.nextAction")
-                DisclosureGroup("Git details", isExpanded: $showProof) {
-                    Text(localSafetyDetail).font(.caption.monospaced()).textSelection(.enabled)
-                }.font(.subheadline)
+                DisclosureGroup("Sync details", isExpanded: $showProof) {
+                    syncDetails
+                }
+                .font(.subheadline)
             }
         }
     }
 
     private var verifiedComplete: Bool {
-        coordinatorStatus.phase == .complete && changeCount == 0 && conflictedFileCount == 0 && shelteredEdits == nil && syncState == .upToDate
+        guard let git = repo?.gitState else { return false }
+        return coordinatorStatus.phase == .complete && changeCount == 0 && conflictedFileCount == 0
+            && shelteredEdits == nil && syncState == .upToDate && !git.commitSHA.isEmpty
+            && git.verifiedCommitSHA == git.commitSHA && git.remoteCommitSHA == git.commitSHA
+            && git.lastVerifiedDate != nil
     }
     private var statusExplanation: String {
         if conflictedFileCount > 0 { return "Both originals are protected. Choose the result you want to keep." }
@@ -423,7 +444,7 @@ struct VaultView: View {
     private var progressText: String {
         if coordinatorStatus.isRunning { return coordinatorStatus.message }
         if isThisRepoSyncing, !state.syncProgress.isEmpty { return state.syncProgress }
-        return String(localized: "Working")
+        return "Waiting for another vault to finish"
     }
 
     private func toneColor(_ tone: PullOutcomeKind.Tone) -> Color {
@@ -438,7 +459,8 @@ struct VaultView: View {
 
     private var localSafetyTitle: String {
         if conflictedFileCount > 0 { return "\(conflictedFileCount) file\(conflictedFileCount == 1 ? "" : "s") need\(conflictedFileCount == 1 ? "s" : "") your choice" }
-        if isBusy { return "Saving your work" }
+        if coordinatorStatus.isRunning || isThisRepoSyncing { return "Syncing your work" }
+        if isBusy { return "Waiting to sync this vault" }
         if verifiedComplete { return "All saved — you’re all set" }
         if changeCount > 0 { return "New edits are waiting to sync" }
         if shelteredEdits != nil { return "Some protected edits need to be put back" }
@@ -448,12 +470,55 @@ struct VaultView: View {
         return "Checking your saved work"
     }
 
-    private var localSafetyDetail: String {
-        guard let repo, !repo.gitState.commitSHA.isEmpty else { return "Nothing has been saved on this phone yet." }
-        let phoneAge = relativeAge(repo.gitState.localCheckpointDate) ?? "present on this phone"
-        let serverSHA = repo.gitState.remoteCommitSHA.flatMap { $0.isEmpty ? nil : String($0.prefix(7)) } ?? "not checked"
-        let serverAge = relativeAge(repo.gitState.lastRemoteCheckDate) ?? "not checked yet"
-        return "PHONE  \(repo.gitState.commitSHA.prefix(7)) • \(phoneAge)\nSERVER \(serverSHA) • checked \(serverAge)"
+    private var syncDetails: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            detailRow("Changes on this iPhone", value: "\(changeCount) file\(changeCount == 1 ? "" : "s") waiting for a local save")
+            detailRow("Saved versions", value: savedVersionsDescription)
+            detailDate("Last local save made by VaultBridge", date: repo?.gitState.localCheckpointDate)
+            detailDate("Last server check", date: repo?.gitState.lastRemoteCheckDate)
+            detailDate("Last full verification", date: repo?.gitState.lastVerifiedDate)
+            detailDate("Local files inspected", date: state.lastRepositoryInspectionDate(repoID: repoID))
+            Text("Local files refresh while this screen is open. Server checks happen during sync. A local save can still be waiting to upload.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let git = repo?.gitState, !git.commitSHA.isEmpty {
+                DisclosureGroup("Technical identifiers") {
+                    Text("Phone commit: \(git.commitSHA.prefix(7))\nLast observed server commit: \(git.remoteCommitSHA.flatMap { $0.isEmpty ? nil : String($0.prefix(7)) } ?? "not checked")")
+                        .font(.caption.monospaced()).textSelection(.enabled)
+                }.font(.caption)
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    private var savedVersionsDescription: String {
+        if coordinatorStatus.isRunning { return "Sync in progress; the result is not verified yet" }
+        if conflictedFileCount > 0 { return "Waiting for your choices" }
+        if state.safetyReviewByRepo[repoID] != nil { return "Unexpected changes need review" }
+        if verifiedComplete { return "Phone and server matched at the last full verification" }
+        switch syncState {
+        case .ahead: return "Saved on this iPhone; waiting to upload"
+        case .behind: return "Server updates are waiting to download"
+        case .diverged: return "Phone and server both have changes to combine"
+        case .upToDate: return "Saved versions match the last observed server copy"
+        case .unknown: return "Not checked yet, or local status is unavailable"
+        }
+    }
+
+    private func detailRow(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            Text(value).font(.subheadline).fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("vault.detail.\(title)")
+        }
+    }
+
+    private func detailDate(_ title: String, date: Date?) -> some View {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .long
+        return detailRow(title, value: date.map {
+            "\(relativeAge($0) ?? "just now") · \(formatter.string(from: $0))"
+        } ?? "Not recorded yet")
     }
 
     private func relativeAge(_ date: Date?) -> String? {

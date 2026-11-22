@@ -38,7 +38,7 @@ final class SyncMDUITests: XCTestCase {
 
     func testGuidedConflictReviewFinishesWithoutGitTools() {
         let app = XCUIApplication()
-        app.launchArguments = ["-SyncSafetyUITest"]
+        app.launchArguments = ["-SyncSafetyUITest", "-SyncProgressUITest"]
         app.launch()
         let next = app.buttons["vault.nextAction"]
         if !next.waitForExistence(timeout: 5) {
@@ -65,7 +65,25 @@ final class SyncMDUITests: XCTestCase {
         XCTAssertTrue(finish.waitForExistence(timeout: 10))
         XCTAssertTrue(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: finish)], timeout: 10) == .completed)
         finish.tap()
+        let progress = app.progressIndicators["review.syncProgress"]
+        XCTAssertTrue(progress.waitForExistence(timeout: 10))
+        let finalStep = app.staticTexts["review.syncProgress.stage"]
+        XCTAssertTrue(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: NSPredicate(format: "label BEGINSWITH 'Step 5 of 5'"), object: finalStep)], timeout: 20) == .completed)
+        // A read-only ProgressView does not accept taps. Verify its rendered
+        // frame is on screen instead of requiring it to be hit-testable.
+        XCTAssertGreaterThan(progress.frame.width, 0)
+        XCTAssertGreaterThan(progress.frame.height, 0)
+        XCTAssertGreaterThan(progress.frame.minY, 100)
+        XCTAssertLessThan(progress.frame.maxY, app.frame.maxY)
+        let verifying = XCTAttachment(screenshot: app.screenshot())
+        verifying.name = "Final verification stage"; verifying.lifetime = .keepAlways; add(verifying)
         XCTAssertTrue(app.staticTexts["All saved — you’re all set"].waitForExistence(timeout: 20))
+        XCTAssertFalse(progress.exists)
+        app.buttons["Sync details"].tap()
+        XCTAssertTrue(app.staticTexts["Last full verification"].waitForExistence(timeout: 5))
+        for title in ["Last local save made by VaultBridge", "Last server check", "Last full verification"] {
+            XCTAssertFalse(app.staticTexts["vault.detail." + title].label.contains("Not recorded"), title)
+        }
         let completion = XCTAttachment(screenshot: app.screenshot())
         completion.name = "Verified saved status"; completion.lifetime = .keepAlways; add(completion)
     }
@@ -83,11 +101,17 @@ final class SyncMDUITests: XCTestCase {
         let guided = app.buttons["conflict.mergeOneFile"]
         for _ in 0..<5 where !guided.exists { app.swipeUp() }
         XCTAssertTrue(guided.waitForExistence(timeout: 10)); guided.tap()
-        let phone = app.buttons["Keep iPhone"]
+        let phone = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'merge.version.' AND identifier ENDSWITH '.phone'")).firstMatch
         XCTAssertTrue(phone.waitForExistence(timeout: 10))
         XCTAssertFalse(app.buttons["Save merged file"].exists)
         phone.tap()
-        app.buttons["Keep Server"].tap()
+        let server = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'merge.version.' AND identifier ENDSWITH '.server'")).firstMatch
+        server.tap()
+        XCTAssertEqual(phone.value as? String, "Selected")
+        XCTAssertEqual(server.value as? String, "Selected")
+        phone.tap()
+        XCTAssertEqual(phone.value as? String, "Not selected")
+        XCTAssertEqual(server.value as? String, "Selected")
         let save = app.buttons["Save merged file"]
         for _ in 0..<4 where !save.exists { app.swipeUp() }
         XCTAssertTrue(save.waitForExistence(timeout: 5))
@@ -133,6 +157,39 @@ final class SyncMDUITests: XCTestCase {
         for _ in 0..<4 where !restore.isHittable { app.swipeUp() }
         restore.tap()
         XCTAssertTrue(app.staticTexts["Restored locally. Your previous file is protected. Sync when ready to upload."].waitForExistence(timeout: 10))
+    }
+
+    func testCheckboxVersionsCanBeChosenIndividuallyByTappingCards() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-SyncSafetyUITest", "-SyncTaskConflictUITest"]
+        app.launch()
+        let next = app.buttons["vault.nextAction"]
+        if !next.waitForExistence(timeout: 5) {
+            let open = app.buttons["Review"].firstMatch
+            XCTAssertTrue(open.waitForExistence(timeout: 20)); open.tap()
+        }
+        XCTAssertTrue(next.waitForExistence(timeout: 10)); next.tap()
+        let merge = app.buttons["conflict.mergeOneFile"]
+        XCTAssertTrue(merge.waitForExistence(timeout: 10)); merge.tap()
+        let stretch = app.buttons["merge.version.1.phone"]
+        XCTAssertTrue(stretch.waitForExistence(timeout: 10))
+        XCTAssertTrue(stretch.label.contains("Completed task"))
+        stretch.tap()
+        let walk = app.buttons["merge.version.2.server"]
+        for _ in 0..<5 where !walk.isHittable { app.swipeUp() }
+        XCTAssertTrue(walk.exists); walk.tap()
+        let preview = app.buttons["Preview complete result"]
+        for _ in 0..<5 where !preview.isHittable { app.swipeUp() }
+        preview.tap()
+        let result = app.staticTexts["merge.result"]
+        XCTAssertTrue(result.waitForExistence(timeout: 5))
+        XCTAssertEqual(result.label, "# Tasks\n- [x] Stretch\n- [x] Walk\n")
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "Individual checkbox choices"; attachment.lifetime = .keepAlways; add(attachment)
+        let save = app.buttons["Save merged file"]
+        for _ in 0..<5 where !save.isHittable || save.frame.maxY > app.frame.maxY - 60 { app.swipeUp() }
+        save.tap()
+        XCTAssertTrue(app.staticTexts["Your choices are saved"].waitForExistence(timeout: 10))
     }
 
     func testLaunch() {

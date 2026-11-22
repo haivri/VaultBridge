@@ -18,22 +18,23 @@ enum SyncSafetyUIFixture {
         git_repository_free(raw)
         let service = LocalGitService(localURL: root)
         try await service.setRemoteURL(name: "origin", url: remote.path)
-        let conflictPath = ProcessInfo.processInfo.arguments.contains("-SyncNoteConflictUITest") ? "Note.md" : ".obsidian/app.json"
+        let taskTest = ProcessInfo.processInfo.arguments.contains("-SyncTaskConflictUITest")
+        let conflictPath = taskTest ? "Tasks.md" : ProcessInfo.processInfo.arguments.contains("-SyncNoteConflictUITest") ? "Note.md" : ".obsidian/app.json"
         let recoveryTest = ProcessInfo.processInfo.arguments.contains("-SyncRecoveryUITest")
         let settings = root.appendingPathComponent(conflictPath)
-        try Data("{\"fontSize\":16}\n".utf8).write(to: settings)
+        try Data((taskTest ? "# Tasks\n- [/] Stretch\n- [/] Walk\n" : "{\"fontSize\":16}\n").utf8).write(to: settings)
         try await service.stageAll()
         _ = try await service.commitLocal(message: "Initial settings", authorName: "Example", authorEmail: "example@example.invalid")
         let branch = try await service.repoInfo().branch
         try await service.createBranch(name: "server")
         try await service.switchBranch(name: "server")
-        try Data("{\"fontSize\":18}\n".utf8).write(to: settings)
+        try Data((taskTest ? "# Tasks\n- [ ] Stretch\n- [x] Walk\n" : "{\"fontSize\":18}\n").utf8).write(to: settings)
         try Data((recoveryTest ? "# Today\nTime 12:00\ncontext\n- [ ] shower\n" : "# Today\n\nA journal entry saved on the computer.\n").utf8).write(to: root.appendingPathComponent("Today.md"))
         try await service.stageAll()
         _ = try await service.commitLocal(message: "Computer changes", authorName: "Example", authorEmail: "example@example.invalid")
         try await service.pushCurrentBranch(pat: "")
         try await service.switchBranch(name: branch)
-        try Data("{\"fontSize\":20}\n".utf8).write(to: settings)
+        try Data((taskTest ? "# Tasks\n- [x] Stretch\n- [ ] Walk\n" : "{\"fontSize\":20}\n").utf8).write(to: settings)
         try await service.stageAll()
         _ = try await service.commitLocal(message: "Phone changes", authorName: "Example", authorEmail: "example@example.invalid")
         do { _ = try await service.mergeBranch(name: "server", authorName: "Example", authorEmail: "example@example.invalid") }

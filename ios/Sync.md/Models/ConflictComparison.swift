@@ -68,7 +68,20 @@ struct ConflictComparison: Sendable {
 /// A preview only: independent edits are combined using the common ancestor;
 /// overlapping edits still require a choice before the user explicitly saves.
 struct ConflictMergeDraft: Sendable {
-    enum Choice: String, CaseIterable, Sendable { case phone = "iPhone", server = "Server", both = "Both" }
+    enum Choice: String, CaseIterable, Sendable {
+        case phone = "iPhone", server = "Server", both = "Both"
+
+        /// Each original is independently selectable; selecting both preserves both.
+        static func toggling(_ side: Choice, in current: Choice?) -> Choice? {
+            guard side != .both else { return current == .both ? nil : .both }
+            switch current {
+            case nil: return side
+            case .both: return side == .phone ? .server : .phone
+            case side: return nil
+            default: return .both
+            }
+        }
+    }
     struct Block: Identifiable, Sendable {
         let id: Int
         let phone: [String]
@@ -85,22 +98,22 @@ struct ConflictMergeDraft: Sendable {
         }
         // Add/add conflicts or unavailable ancestors cannot establish which
         // version changed. Keep the conservative, explicit two-way choices.
-        let rows = ConflictComparison(phone: phone, server: server, context: Int.max / 4).rows
+        let original = phone.components(separatedBy: "\n")
+        let changes = Self.edits(from: original, to: server.components(separatedBy: "\n"), phone: false)
         var result: [Block] = []
-        var left: [String] = [], right: [String] = []
-        var shared: Bool?
-        func flush() {
-            guard let shared else { return }
-            result.append(Block(id: result.count, phone: left, server: right, shared: shared))
-            left = []; right = []
+        var cursor = 0
+        for edit in changes {
+            if cursor < edit.range.lowerBound {
+                let context = Array(original[cursor..<edit.range.lowerBound])
+                result.append(Block(id: result.count, phone: context, server: context, shared: true))
+            }
+            result.append(Block(id: result.count, phone: Array(original[edit.range]), server: edit.lines, shared: false))
+            cursor = edit.range.upperBound
         }
-        for row in rows where row.kind != .omitted {
-            let same = row.kind == .context
-            if shared != same { flush(); shared = same }
-            if row.kind == .phone || same { left.append(row.text) }
-            if row.kind == .server || same { right.append(row.text) }
+        if cursor < original.count {
+            let context = Array(original[cursor...])
+            result.append(Block(id: result.count, phone: context, server: context, shared: true))
         }
-        flush()
         blocks = result
     }
 
@@ -112,7 +125,14 @@ struct ConflictMergeDraft: Sendable {
 
     private static func edits(from base: [String], to version: [String], phone: Bool) -> [Edit] {
         var removed = Set<Int>(), inserted = Set<Int>()
-        for change in version.difference(from: base) {
+        // Align an unchanged task body even when its marker differs. This
+        // makes adjacent checkbox changes independent edits, not one large hunk.
+        let delta = version.difference(from: base) { left, right in
+            if left == right { return true }
+            guard let a = MarkdownTaskLine(left), let b = MarkdownTaskLine(right) else { return false }
+            return a.identity == b.identity
+        }
+        for change in delta {
             switch change {
             case .remove(let offset, _, _): removed.insert(offset)
             case .insert(let offset, _, _): inserted.insert(offset)
@@ -128,6 +148,9 @@ struct ConflictMergeDraft: Sendable {
             if i != start || !replacement.isEmpty {
                 result.append(Edit(range: start..<i, lines: replacement, phone: phone))
             } else {
+                if i < base.count, j < version.count, base[i] != version[j] {
+                    result.append(Edit(range: i..<(i + 1), lines: [version[j]], phone: phone))
+                }
                 i += 1; j += 1
             }
         }
@@ -211,5 +234,27 @@ struct ConflictMergeDraft: Sendable {
             }
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+/// Parse a Markdown task without normalizing or rewriting its original bytes.
+/// Custom Obsidian task markers remain distinct, including cancellation/reopen.
+nonisolated struct MarkdownTaskLine: Sendable {
+    let prefix: String
+    let marker: String
+    let suffix: String
+    var identity: String { prefix + suffix }
+    var isCompleted: Bool { marker == "x" || marker == "X" }
+    var statusLabel: String {
+        if isCompleted { return "Completed task" }
+        if marker == " " { return "Unchecked task" }
+        return "Task status [\(marker)]"
+    }
+
+    init?(_ line: String) {
+        guard let match = line.firstMatch(of: /^([ \t]*(?:[-+*]|[0-9]+[.)])[ \t]+\[)([^\]\r\n])(\](?:[ \t].*)?\r?)$/) else { return nil }
+        prefix = String(match.1)
+        marker = String(match.2)
+        suffix = String(match.3)
     }
 }

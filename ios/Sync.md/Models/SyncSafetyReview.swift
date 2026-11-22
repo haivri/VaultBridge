@@ -22,9 +22,23 @@ nonisolated enum ProtectedNoteText {
     static func missing(expected: String, current: String) -> [String] {
         var counts: [String: Int] = [:]
         for line in lines(current) { counts[line, default: 0] += 1 }
-        return lines(expected).filter { line in
+        // Match exact occurrences first, so duplicate tasks cannot consume
+        // another task's protection. Completing an unchanged task is not text
+        // loss; reopening a received completed task still requires review.
+        let unmatched = lines(expected).filter { line in
             if counts[line, default: 0] > 0 { counts[line, default: 0] -= 1; return false }
             return !line.isEmpty
+        }
+        return unmatched.filter { line in
+            guard let task = MarkdownTaskLine(line), task.marker == " " || task.isCompleted else { return true }
+            for marker in ["x", "X"] {
+                let completed = task.prefix + marker + task.suffix
+                if counts[completed, default: 0] > 0 {
+                    counts[completed, default: 0] -= 1
+                    return false
+                }
+            }
+            return true
         }
     }
 }
