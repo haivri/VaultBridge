@@ -186,6 +186,7 @@ struct VaultView: View {
                     shelteredEditsCard(shelteredEdits)
                 }
                 syncCard
+                Text(repo.gitState.saveStatusTimes).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 if !statusEntries.isEmpty {
                     changedFilesCard
                 }

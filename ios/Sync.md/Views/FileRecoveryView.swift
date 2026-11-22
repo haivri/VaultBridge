@@ -4,9 +4,19 @@ struct FileRecoveryView: View {
     @Environment(AppState.self) private var state
     let repoID: UUID
     @State private var latestMerge: GitCommitSummary?
+    @State private var notes: [String] = []
+    @State private var query = ""
+    @State private var loadFailure: String?
     var body: some View {
         List {
-            Section {
+            Section("Find a note") {
+                ForEach(notes.filter { query.isEmpty || $0.localizedCaseInsensitiveContains(query) }.prefix(100), id: \.self) { path in
+                    NavigationLink(path) { RecoveryNoteVersionsView(repoID: repoID, path: path) }
+                }
+                if let loadFailure { Text(loadFailure).foregroundStyle(.red) }
+                Text("Includes deleted notes. Search to narrow the list. Obsidian File Recovery snapshots are separate; open them in Obsidian Settings → File recovery.").font(.caption)
+            }
+            Section("Browse checkpoints") {
                 Text("Choose a saved checkpoint, then a file to recover. For a merge, you can restore the iPhone or incoming original from before your choice. Your current file is protected first.")
             }
             if let latestMerge {
@@ -33,6 +43,11 @@ struct FileRecoveryView: View {
             }
         }
         .navigationTitle("Recover previous work")
+        .searchable(text: $query, prompt: "Find a note")
+        .task {
+            do { notes = try await state.serializedRepository(repoID: repoID).recoveryNotes() }
+            catch { loadFailure = "Note history could not be loaded. Your files are unchanged." }
+        }
         .task {
             await state.loadCommitHistory(repoID: repoID, reset: true)
             for commit in (state.commitHistoryByRepo[repoID] ?? []).prefix(20) {
@@ -93,4 +108,99 @@ private struct RecoveryFilesView: View {
         }
     }
 
+}
+
+
+struct RecoveryNoteVersionsView: View {
+    @Environment(AppState.self) private var state
+    let repoID: UUID
+    let path: String
+    @State private var versions: [GitCommitSummary] = []
+    @State private var more = true
+    @State private var busy = false
+    @State private var error: String?
+    var body: some View {
+        List {
+            Text(path).font(.caption).textSelection(.enabled)
+            ForEach(Array(versions.enumerated()), id: \.offset) { offset, version in
+                NavigationLink {
+                    NoteRecoveryPreviewView(repoID: repoID, path: path, commit: version.oid)
+                } label: {
+                    VStack(alignment: .leading) {
+                        Text(version.authoredDate.formatted(date: .abbreviated, time: .standard))
+                        Text(version.message).font(.caption)
+                    }
+                }.accessibilityIdentifier("recovery.version.\(offset)")
+            }
+            if let error { Text(error).foregroundStyle(.red) }
+            if more { Button("Earlier versions") { Task { await load() } }.disabled(busy) }
+            if busy { ProgressView() }
+        }.navigationTitle("Note versions").task { if versions.isEmpty { await load() } }
+    }
+    private func load() async {
+        guard !busy else { return }; busy = true; defer { busy = false }
+        do {
+            let next = try await state.serializedRepository(repoID: repoID).noteHistory(path: path, limit: 50, skip: versions.count)
+            versions += next; more = next.count == 50
+        } catch { self.error = error.localizedDescription }
+    }
+}
+
+struct NoteRecoveryPreviewView: View {
+    @Environment(AppState.self) private var state
+    let repoID: UUID
+    let path: String
+    let commit: String
+    @State private var preview: NoteRecoveryPreview?
+    @State private var selected = Set<Int>()
+    @State private var result: String?
+    @State private var busy = false
+    @State private var confirmWhole = false
+    private var rendered: String {
+        guard let draft = preview?.draft else { return "" }
+        return draft.result(choices: Dictionary(uniqueKeysWithValues: draft.changes.map { ($0.id, selected.contains($0.id) ? ConflictMergeDraft.Choice.server : .phone) })) ?? ""
+    }
+    var body: some View {
+        List {
+            Text("Select changes to restore. Everything else keeps its current text. Nothing uploads until you sync.")
+            if let preview {
+                ForEach(preview.draft.changes) { block in
+                    Section {
+                        Text("Current").font(.caption)
+                        Text(block.phone.joined(separator: "\n")).textSelection(.enabled)
+                        Text("Historical").font(.caption)
+                        Text(block.server.joined(separator: "\n")).textSelection(.enabled)
+                        Toggle("Restore this change", isOn: Binding(get: { selected.contains(block.id) }, set: { if $0 { selected.insert(block.id) } else { selected.remove(block.id) } })).accessibilityIdentifier("recovery.change.\(block.id)")
+                    }
+                }
+                Section("Result preview") { Text(rendered).textSelection(.enabled).accessibilityIdentifier("recovery.result") }
+                Button("Restore selected changes") { restore(whole: false) }.disabled(selected.isEmpty || busy)
+            }
+            if let result { Text(result).textSelection(.enabled) }
+            Button("Replace whole file…", role: .destructive) { confirmWhole = true }.disabled(busy)
+            if busy { ProgressView() }
+        }
+        .navigationTitle("Compare and recover")
+        .confirmationDialog("Replace the entire file? Newer checkboxes and text will be replaced. Its current bytes are backed up first.", isPresented: $confirmWhole) {
+            Button("Replace whole file", role: .destructive) { restore(whole: true) }
+        }
+        .task {
+            do { preview = try await state.serializedRepository(repoID: repoID).recoveryPreview(path: path, commit: commit) }
+            catch { result = error.localizedDescription }
+        }
+    }
+    private func restore(whole: Bool) {
+        busy = true
+        Task {
+            defer { busy = false }
+            do {
+                let repository = try state.serializedRepository(repoID: repoID)
+                if whole { try await repository.restoreFile(path: path, from: commit) }
+                else if let preview { try await repository.restoreSelection(preview: preview, selected: selected) }
+                state.detectChanges(repoID: repoID)
+                result = "Restored locally. Your previous file is protected. Sync when ready to upload."
+                preview = nil; selected = []
+            } catch { result = error.localizedDescription }
+        }
+    }
 }

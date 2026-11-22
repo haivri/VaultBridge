@@ -72,3 +72,18 @@ files from the preferred action. Existing merge and recovery UI tests passed.
 The Release iPhone build passed and its signature was verified with the existing
 valid ad hoc profile. Version 1.1.4 was installed in place using the existing app
 identity. The live vault was not used as a test fixture.
+
+## 1.2.0 text protection and recovery validation (2026-11-22)
+
+The native unit/integration suite passed all 219 tests. Final focused validation
+passed the three affected persistence, approval, and selective-recovery tests and
+all five UI tests. The synthetic recovery screen restored a missing timestamp
+while retaining a newer checked box. Coverage includes legacy recovery manifests,
+unrelated integrations, restart, stale decisions, repeated lines, Unicode, CRLF,
+local recovery copies, and saving without an upload. One simulator run hit a
+Busy app-launch service; restarting only that test simulator resolved it. The
+new toggle UI test targets the switch control explicitly.
+
+The Release iPhone build passed with the existing private app identity supplied
+only as a build override. The existing ad hoc profile remains valid. No real
+vault was used as a test fixture, and no vault was replaced, reset, or recloned.

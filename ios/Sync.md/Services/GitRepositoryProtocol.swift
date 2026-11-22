@@ -77,6 +77,10 @@ protocol GitRepositoryProtocol: Sendable {
     func fetchRemote(pat: String) async throws
     func commitHistory(limit: Int, skip: Int) async throws -> [GitCommitSummary]
     func commitDetail(oid: String) async throws -> GitCommitDetail
+    func recoveryNotes() async throws -> [String]
+    func noteHistory(path: String, limit: Int, skip: Int) async throws -> [GitCommitSummary]
+    func recoveryPreview(path: String, commit: String) async throws -> NoteRecoveryPreview
+    func restoreSelection(preview: NoteRecoveryPreview, selected: Set<Int>) async throws
     func restoreFile(path: String, from commit: String) async throws
     func reviewSafetyChanges(approve: Bool, review: SyncSafetyReview) async throws
     func verifySync(pat: String) async throws -> LocalRepoInfo
@@ -86,6 +90,10 @@ protocol GitRepositoryProtocol: Sendable {
 }
 
 extension GitRepositoryProtocol {
+    func recoveryNotes() async throws -> [String] { [] }
+    func noteHistory(path: String, limit: Int, skip: Int) async throws -> [GitCommitSummary] { [] }
+    func recoveryPreview(path: String, commit: String) async throws -> NoteRecoveryPreview { throw LocalGitError.repositoryCorrupted("Note preview unavailable") }
+    func restoreSelection(preview: NoteRecoveryPreview, selected: Set<Int>) async throws { throw LocalGitError.repositoryCorrupted("Selective recovery unavailable") }
     func restoreFile(path: String, from commit: String) async throws { throw LocalGitError.repositoryCorrupted("File recovery is unavailable for this repository.") }
     func reviewSafetyChanges(approve: Bool, review: SyncSafetyReview) async throws { throw LocalGitError.repositoryCorrupted("Recovery is unavailable for this repository.") }
     func verifySync(pat: String) async throws -> LocalRepoInfo { try await repoInfo() }

@@ -98,3 +98,28 @@ at `ios/GITSYNCMD_LICENSE`.
 
 VaultBridge is MIT licensed. Dependencies retain their own licenses; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+
+## Protected text and selective recovery (1.2.0)
+
+Protection now persists per incoming note across unrelated syncs and restarts.
+Removing or replacing protected Markdown text requires review, including a
+missing timestamp alongside another edit. Intentional edits to protected
+checkboxes or sentences can also require approval. The review displays the lost
+text and rejects decisions made against older file or staged versions. Additions,
+line-ending conversion, and reordering unchanged text do not trigger text-loss
+review. Explicitly approved losses do not produce recurring prompts after saving.
+
+**Recover previous work** now starts with searchable notes, including deleted
+notes. Open a version, select changes, and inspect the result before restoring.
+Other text and newer checkboxes remain current. Whole-file replacement remains a
+separate explicit action. Current bytes are protected first; local recovery copies
+also appear in note history. Nothing uploads until you sync. Selective previews
+support UTF-8 notes up to 4 MiB and bounded line comparisons. Whole-file recovery
+remains available when a selective preview cannot be displayed. Obsidian File
+Recovery snapshots remain separate, in Obsidian's File recovery settings.
+
+The vault and dashboard show **Saved locally at** and **Server verified at** with
+the date and timezone. Offline saves and background activity do not make an old
+verification look new. Existing vault configuration and protection records remain
+compatible; missing legacy timestamps are shown as unknown.

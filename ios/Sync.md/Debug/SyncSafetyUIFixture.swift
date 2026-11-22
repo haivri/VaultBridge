@@ -19,6 +19,7 @@ enum SyncSafetyUIFixture {
         let service = LocalGitService(localURL: root)
         try await service.setRemoteURL(name: "origin", url: remote.path)
         let conflictPath = ProcessInfo.processInfo.arguments.contains("-SyncNoteConflictUITest") ? "Note.md" : ".obsidian/app.json"
+        let recoveryTest = ProcessInfo.processInfo.arguments.contains("-SyncRecoveryUITest")
         let settings = root.appendingPathComponent(conflictPath)
         try Data("{\"fontSize\":16}\n".utf8).write(to: settings)
         try await service.stageAll()
@@ -27,7 +28,7 @@ enum SyncSafetyUIFixture {
         try await service.createBranch(name: "server")
         try await service.switchBranch(name: "server")
         try Data("{\"fontSize\":18}\n".utf8).write(to: settings)
-        try Data("# Today\n\nA journal entry saved on the computer.\n".utf8).write(to: root.appendingPathComponent("Today.md"))
+        try Data((recoveryTest ? "# Today\nTime 12:00\ncontext\n- [ ] shower\n" : "# Today\n\nA journal entry saved on the computer.\n").utf8).write(to: root.appendingPathComponent("Today.md"))
         try await service.stageAll()
         _ = try await service.commitLocal(message: "Computer changes", authorName: "Example", authorEmail: "example@example.invalid")
         try await service.pushCurrentBranch(pat: "")
@@ -37,12 +38,21 @@ enum SyncSafetyUIFixture {
         _ = try await service.commitLocal(message: "Phone changes", authorName: "Example", authorEmail: "example@example.invalid")
         do { _ = try await service.mergeBranch(name: "server", authorName: "Example", authorEmail: "example@example.invalid") }
         catch LocalGitError.mergeConflictsDetected { }
+        var safetyReview: SyncSafetyReview?
+        if recoveryTest {
+            try await service.resolveConflict(path: conflictPath, strategy: .theirs)
+            _ = try await service.completeMerge(message: "Combine notes", authorName: "Example", authorEmail: "example@example.invalid")
+            try Data("# Today\ncontext\n- [x] shower\n".utf8).write(to: root.appendingPathComponent("Today.md"))
+            do { try await service.stageAll() }
+            catch LocalGitError.suspiciousChanges(let review) { safetyReview = review }
+        }
         let info = try await service.repoInfo()
         let bookmark = try root.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
         let repo = RepoConfig(repoURL: "https://example.invalid/practice-vault.git", branch: branch,
             authorName: "Example", authorEmail: "example@example.invalid", vaultFolderName: "Practice vault",
             customVaultBookmarkData: bookmark, gitState: GitState(commitSHA: info.commitSHA, treeSHA: "", branch: branch, blobSHAs: [:], lastSyncDate: .distantPast), autoSyncEnabled: false)
         state.repos = [repo]
+        if let safetyReview { state.safetyReviewByRepo[repo.id] = safetyReview }
         state.validateClonedRepos()
         _ = try await state.inspectRepositoryForVaultBridge(repoID: repo.id)
         await state.loadConflictSession(repoID: repo.id)

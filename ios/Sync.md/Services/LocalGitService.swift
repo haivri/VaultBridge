@@ -2912,6 +2912,8 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             defer { if let repo { git_repository_free(repo) } }
             try git2Check(git_repository_open(&repo, repoPath), context: "Open repo")
 
+            try Self.guardSuspiciousChanges(repo: repo)
+
             var index: OpaquePointer?
             defer { if let index { git_index_free(index) } }
             try git2Check(git_repository_index(&index, repo), context: "Get index")
@@ -3324,6 +3326,8 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             var repo: OpaquePointer?
             defer { if let repo { git_repository_free(repo) } }
             try git2Check(git_repository_open(&repo, repoPath), context: "Open repo")
+
+            try Self.guardSuspiciousChanges(repo: repo)
 
             var index: OpaquePointer?
             defer { if let index { git_index_free(index) } }
@@ -4026,6 +4030,8 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
             try git2Check(git_repository_open(&repo, path), context: "Open repo")
 
             // Use currently staged content only
+            try Self.guardSuspiciousChanges(repo: repo)
+
             var index: OpaquePointer?
             defer { if let index { git_index_free(index) } }
             try git2Check(git_repository_index(&index, repo), context: "Get index")
@@ -4253,6 +4259,8 @@ final class LocalGitService: GitRepositoryProtocol, @unchecked Sendable {
                 localURL: URL(fileURLWithPath: path, isDirectory: true),
                 credentials: GitRemoteCredentials.fromTransportPayload(pat)
             ).verifyPushAllowed(changedPaths: pushedPaths, refName: "refs/heads/\(branchName)")
+
+            try Self.guardSuspiciousChanges(repo: repo)
 
             // Verify the complete current LFS snapshot before every branch
             // push. A server-side hole from an older app build must not remain
@@ -5582,7 +5590,60 @@ nonisolated private func skipICloudEvictionCallback(
 // Recovery manifests are private repository metadata, never diagnostic journals.
 extension LocalGitService {
     private struct ReceivedFile: Codable { let path: String; let expected: String; let previous: String? }
-    private struct SafetyManifest: Codable { var incoming: [ReceivedFile] = []; var approved: String? }
+    private struct ApprovedVersion: Codable { let path: String; let oid: String? }
+    private struct SafetyApproval: Codable { let head: String; let versions: [ApprovedVersion]; var protection: String? = nil }
+    private struct SafetyManifest: Codable { var incoming: [ReceivedFile] = []; var approved: String?; var approval: SafetyApproval? }
+
+    private static func blobBytes(repo: OpaquePointer?, identifier: String) throws -> Data {
+        var oid = git_oid(); try git2Check(git_oid_fromstr(&oid, identifier), context: "Read protected version")
+        var blob: OpaquePointer?; defer { if let blob { git_blob_free(blob) } }
+        try git2Check(git_blob_lookup(&blob, repo, &oid), context: "Read protected text")
+        return Data(bytes: git_blob_rawcontent(blob), count: Int(git_blob_rawsize(blob)))
+    }
+    private static func settleSafetyApproval(repo: OpaquePointer?, manifest: inout SafetyManifest) throws {
+        guard let approval = manifest.approval else { return }
+        var head = git_oid(); try git2Check(git_reference_name_to_id(&head, repo, "HEAD"), context: "Read saved version")
+        guard oidToHex(&head) != approval.head else { return }
+        for version in approval.versions {
+            guard try blobID(repo: repo, commitOID: &head, path: version.path) == version.oid else { return }
+        }
+        let paths = Set(approval.versions.map(\.path))
+        manifest.incoming.removeAll { paths.contains($0.path) }
+        for version in approval.versions {
+            if let oid = version.oid { manifest.incoming.append(ReceivedFile(path: version.path, expected: oid, previous: nil)) }
+        }
+        manifest.approval = nil; manifest.approved = nil
+        try writeSafety(manifest, repo: repo)
+    }
+    private static func indexFingerprint(repo: OpaquePointer?) throws -> String {
+        var index: OpaquePointer?; defer { if let index { git_index_free(index) } }
+        try git2Check(git_repository_index(&index, repo), context: "Read staged versions")
+        var value = ""
+        for n in 0..<git_index_entrycount(index) {
+            guard let entry = git_index_get_byindex(index, n)?.pointee else { continue }
+            var oid = entry.id
+            value += String(cString: entry.path) + ":" + oidToHex(&oid) + ":" + String(entry.mode) + ":" + String(entry.flags) + "\n"
+        }
+        return value
+    }
+    private static func protectionFingerprint(_ manifest: SafetyManifest) throws -> String {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        return SHA256.hash(data: try encoder.encode(manifest.incoming)).description
+    }
+    private static func safetyFingerprint(paths: [String], repo: OpaquePointer?, manifest: SafetyManifest) throws -> String {
+        var head = git_oid(); try git2Check(git_reference_name_to_id(&head, repo, "HEAD"), context: "Read recovery version")
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        var signature = oidToHex(&head) + (try indexFingerprint(repo: repo)) + String(decoding: try encoder.encode(manifest.incoming), as: UTF8.self)
+        for path in paths.sorted() { signature += "\n" + path + ":" + (try workingFingerprint(path, repo: repo)) }
+        return SHA256.hash(data: Data(signature.utf8)).description
+    }
+    private static func workingBlobID(_ path: String, repo: OpaquePointer?) throws -> String? {
+        let file = try guardedFile(path, repo: repo)
+        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
+        var oid = git_oid()
+        try git2Check(git_blob_create_from_workdir(&oid, repo, path), context: "Protect reviewed bytes")
+        return oidToHex(&oid)
+    }
 
     private static func safetyURL(repo: OpaquePointer?) throws -> URL {
         guard let directory = git_repository_path(repo) else { throw LocalGitError.notCloned }
@@ -5614,7 +5675,9 @@ extension LocalGitService {
         var manifest = try readSafety(repo: repo)
         // A no-op sync must not erase protection of recently received files.
         guard !paths.isEmpty else { return }
-        manifest.incoming = try paths.compactMap { path in
+        try settleSafetyApproval(repo: repo, manifest: &manifest)
+        manifest.incoming.removeAll { paths.contains($0.path) }
+        manifest.incoming += try paths.compactMap { path in
             guard let expected = try blobID(repo: repo, commitOID: after, path: path) else { return nil }
             return ReceivedFile(path: path, expected: expected, previous: try blobID(repo: repo, commitOID: before, path: path))
         }
@@ -5648,31 +5711,54 @@ extension LocalGitService {
         let total = max(1, Int(git_index_entrycount(index)))
         var paths = Set<String>()
         if deleted.count >= 20 || (deleted.count >= 5 && Double(deleted.count) / Double(total) >= 0.2) { paths.formUnion(deleted.map(\.path)) }
-        let manifest = try readSafety(repo: repo)
+        var manifest = try readSafety(repo: repo)
+        try settleSafetyApproval(repo: repo, manifest: &manifest)
+        var details: [SyncSafetyReview.Detail] = []
         for received in manifest.incoming {
-            guard let change = entries.first(where: { $0.path == received.path }), change.oldPath == nil else { continue }
-            if change.workTreeStatus == .deleted || change.indexStatus == .deleted { paths.insert(received.path); continue }
-            if let previous = received.previous, previous != received.expected {
-                let file = try guardedFile(received.path, repo: repo)
-                if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 1_048_576,
-                   let data = try? Data(contentsOf: file) {
-                    var oid = git_oid()
-                    try data.withUnsafeBytes { bytes in try git2Check(git_odb_hash(&oid, bytes.baseAddress, data.count, GIT_OBJECT_BLOB), context: "Check file contents") }
-                    if oidToHex(&oid) == previous { paths.insert(received.path) }
-                }
+            let file = try guardedFile(received.path, repo: repo)
+            let exists = FileManager.default.fileExists(atPath: file.path)
+            let staged = received.path.withCString { git_index_get_bypath(index, $0, 0)?.pointee }
+            let stagedOID = staged?.id
+            let stagedID = stagedOID.map { value -> String in var copy = value; return oidToHex(&copy) }
+            var reason = !exists || stagedID == nil ? "Protected file removed" : ""
+            var removed: [String] = []
+            if exists, stagedID == received.expected, try workingBlobID(received.path, repo: repo) == received.expected { continue }
+            if received.path.lowercased().hasSuffix(".md") {
+                do {
+                    let expected = try ProtectedNoteText.decode(blobBytes(repo: repo, identifier: received.expected))
+                    let current = exists ? try ProtectedNoteText.decode(Data(contentsOf: file)) : ""
+                    let stagedText = try stagedID.map { try ProtectedNoteText.decode(blobBytes(repo: repo, identifier: $0)) } ?? ""
+                    for candidate in [current, stagedText] {
+                        let missing = ProtectedNoteText.missing(expected: expected, current: candidate)
+                        var counts: [String: Int] = [:], seen: [String: Int] = [:]
+                        for line in removed { counts[line, default: 0] += 1 }
+                        for line in missing { seen[line, default: 0] += 1; if seen[line, default: 0] > counts[line, default: 0] { removed.append(line) } }
+                    }
+                    if !removed.isEmpty { reason = "Protected text removed or replaced" }
+                } catch { reason = "Protected Markdown could not be assessed" }
+            } else if exists, let previous = received.previous, previous != received.expected {
+                if try workingBlobID(received.path, repo: repo) == previous || stagedID == previous { reason = "Protected file reverted" }
+            }
+            if !reason.isEmpty {
+                paths.insert(received.path)
+                details.append(.init(path: received.path, reason: reason, removed: removed))
             }
         }
         guard !paths.isEmpty else { return nil }
-        var head = git_oid(); try git2Check(git_reference_name_to_id(&head, repo, "HEAD"), context: "Read recovery version")
-        var signature = oidToHex(&head)
-        for path in paths.sorted() {
-            signature += "\n" + path
-            if let data = try? Data(contentsOf: guardedFile(path, repo: repo)) { signature += SHA256.hash(data: data).description }
-            else { signature += "missing" }
-        }
-        let fingerprint = SHA256.hash(data: Data(signature.utf8)).description
+        let fingerprint = try safetyFingerprint(paths: Array(paths), repo: repo, manifest: manifest)
         guard manifest.approved != fingerprint else { return nil }
-        return SyncSafetyReview(paths: paths.sorted(), fingerprint: fingerprint)
+        if let approval = manifest.approval, Set(approval.versions.map(\.path)) == paths,
+           approval.protection == (try protectionFingerprint(manifest)) {
+            var head = git_oid(); try git2Check(git_reference_name_to_id(&head, repo, "HEAD"), context: "Check reviewed save")
+            var matches = oidToHex(&head) == approval.head
+            for version in approval.versions {
+                let staged = version.path.withCString { git_index_get_bypath(index, $0, 0)?.pointee }
+                let stagedID = staged.map { value -> String in var oid = value.id; return oidToHex(&oid) }
+                if try workingBlobID(version.path, repo: repo) != version.oid || stagedID != version.oid { matches = false }
+            }
+            if matches { return nil } // Only the exact authorized bytes were staged.
+        }
+        return SyncSafetyReview(paths: paths.sorted(), fingerprint: fingerprint, details: details)
     }
     private static func guardSuspiciousChanges(repo: OpaquePointer?) throws {
         if let review = try assessLosses(repo: repo) { throw LocalGitError.suspiciousChanges(review) }
@@ -5684,7 +5770,12 @@ extension LocalGitService {
             try git2Check(git_repository_open(&repo, location.path), context: "Open recovery")
             guard try Self.assessLosses(repo: repo) == review else { throw LocalGitError.repositoryCorrupted("The files changed. Review their latest versions first.") }
             var manifest = try Self.readSafety(repo: repo)
-            if approve { manifest.approved = review.fingerprint; try Self.writeSafety(manifest, repo: repo); return }
+            if approve {
+                var head = git_oid(); try git2Check(git_reference_name_to_id(&head, repo, "HEAD"), context: "Read reviewed version")
+                let versions = try review.paths.map { ApprovedVersion(path: $0, oid: try Self.workingBlobID($0, repo: repo)) }
+                manifest.approval = SafetyApproval(head: oidToHex(&head), versions: versions, protection: try Self.protectionFingerprint(manifest))
+                manifest.approved = review.fingerprint; try Self.writeSafety(manifest, repo: repo); return
+            }
             var head = git_oid(); try git2Check(git_reference_name_to_id(&head, repo, "HEAD"), context: "Read protected version")
             var restoredIndex: OpaquePointer?
             defer { if let restoredIndex { git_index_free(restoredIndex) } }
@@ -5711,18 +5802,19 @@ extension LocalGitService {
             var repo: OpaquePointer?; defer { if let repo { git_repository_free(repo) } }
             try git2Check(git_repository_open(&repo, root.path), context: "Open file recovery")
             guard git_repository_state(repo) == 0 else { throw LocalGitError.repositoryCorrupted("Finish reviewing the current combine before restoring another version.") }
-            var oid = git_oid(); try git2Check(git_oid_fromstr(&oid, commit), context: "Read selected checkpoint")
-            guard let identifier = try Self.blobID(repo: repo, commitOID: &oid, path: path) else { throw LocalGitError.repositoryCorrupted("This file does not exist in the selected checkpoint.") }
-            var blobOID = git_oid(); try git2Check(git_oid_fromstr(&blobOID, identifier), context: "Read saved file ID")
-            var blob: OpaquePointer?; defer { if let blob { git_blob_free(blob) } }
-            try git2Check(git_blob_lookup(&blob, repo, &blobOID), context: "Read saved file")
+            let bytes = try Self.recoveryBytes(path: path, source: commit, repo: repo)
             let file = try Self.guardedFile(path, repo: repo)
             try Self.backupWorkingFile(path, repo: repo)
-            let bytes = Data(bytes: git_blob_rawcontent(blob), count: Int(git_blob_rawsize(blob)))
             try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
             try bytes.write(to: file, options: .atomic)
             var manifest = try Self.readSafety(repo: repo)
+            var index: OpaquePointer?; defer { if let index { git_index_free(index) } }
+            try git2Check(git_repository_index(&index, repo), context: "Read restored file index")
+            try git2Check(git_index_add_bypath(index, path), context: "Record restored file")
+            try git2Check(git_index_write(index), context: "Save restored file index")
             manifest.incoming.removeAll { $0.path == path }
+            if let identifier = try Self.workingBlobID(path, repo: repo) { manifest.incoming.append(ReceivedFile(path: path, expected: identifier, previous: nil)) }
+            manifest.approval = nil; manifest.approved = nil
             try Self.writeSafety(manifest, repo: repo)
         }.value
     }
@@ -5739,5 +5831,158 @@ extension LocalGitService {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try FileManager.default.copyItem(at: file, to: folder.appendingPathComponent("content"))
         try Data(path.utf8).write(to: folder.appendingPathComponent("source"), options: .atomic)
+    }
+}
+
+extension LocalGitService {
+    private static func recoveryWalk(repo: OpaquePointer?) throws -> OpaquePointer {
+        var walk: OpaquePointer?
+        try git2Check(git_revwalk_new(&walk, repo), context: "Read recovery history")
+        guard let walk else { throw LocalGitError.repositoryCorrupted("History is unavailable") }
+        git_revwalk_sorting(walk, GIT_SORT_TIME.rawValue | GIT_SORT_TOPOLOGICAL.rawValue)
+        let code = git_revwalk_push_glob(walk, "refs/*")
+        if code != 0 { git_revwalk_free(walk); try git2Check(code, context: "Read protected histories") }
+        return walk
+    }
+    func recoveryNotes() async throws -> [String] {
+        let location = localURL
+        return try await Task.detached {
+            var repo: OpaquePointer?; defer { if let repo { git_repository_free(repo) } }
+            try git2Check(git_repository_open(&repo, location.path), context: "Open recovery")
+            let walk = try Self.recoveryWalk(repo: repo); defer { git_revwalk_free(walk) }
+            var names = Set<String>(); var oid = git_oid()
+            while git_revwalk_next(&oid, walk) == 0 {
+                try Task.checkCancellation()
+                var commit: OpaquePointer?; defer { if let commit { git_commit_free(commit) } }
+                try git2Check(git_commit_lookup(&commit, repo, &oid), context: "Read recovery checkpoint")
+                var tree: OpaquePointer?; defer { if let tree { git_tree_free(tree) } }
+                try git2Check(git_commit_tree(&tree, commit), context: "Read recovery files")
+                var parent: OpaquePointer?; defer { if let parent { git_commit_free(parent) } }
+                var parentTree: OpaquePointer?; defer { if let parentTree { git_tree_free(parentTree) } }
+                if git_commit_parentcount(commit) > 0 {
+                    try git2Check(git_commit_parent(&parent, commit, 0), context: "Read previous checkpoint")
+                    try git2Check(git_commit_tree(&parentTree, parent), context: "Read previous files")
+                }
+                var diff: OpaquePointer?; defer { if let diff { git_diff_free(diff) } }
+                try git2Check(git_diff_tree_to_tree(&diff, repo, parentTree, tree, nil), context: "Read changed notes")
+                for n in 0..<git_diff_num_deltas(diff) {
+                    guard let delta = git_diff_get_delta(diff, n)?.pointee else { continue }
+                    for path in [delta.old_file.path, delta.new_file.path].compactMap({ $0.map { String(cString: $0) } }) where path.lowercased().hasSuffix(".md") { names.insert(path) }
+                }
+            }
+            names.formUnion(try Self.recoveryCopies(repo: repo).map(\.path).filter { $0.lowercased().hasSuffix(".md") })
+            return names.sorted()
+        }.value
+    }
+    func noteHistory(path: String, limit: Int, skip: Int) async throws -> [GitCommitSummary] {
+        let location = localURL
+        return try await Task.detached {
+            var repo: OpaquePointer?; defer { if let repo { git_repository_free(repo) } }
+            try git2Check(git_repository_open(&repo, location.path), context: "Open note history")
+            _ = try Self.guardedFile(path, repo: repo)
+            let walk = try Self.recoveryWalk(repo: repo); defer { git_revwalk_free(walk) }
+            let copies = try Self.recoveryCopies(repo: repo, path: path).map(\.summary)
+            var result = Array(copies.dropFirst(max(0, skip)).prefix(max(0, limit)))
+            var seen = copies.count; var oid = git_oid()
+            while result.count < max(0, limit), git_revwalk_next(&oid, walk) == 0 {
+                try Task.checkCancellation()
+                var commit: OpaquePointer?; defer { if let commit { git_commit_free(commit) } }
+                try git2Check(git_commit_lookup(&commit, repo, &oid), context: "Read note checkpoint")
+                let blob = try Self.blobID(repo: repo, commitOID: &oid, path: path)
+                let parent = git_commit_parent_id(commit, 0)
+                let oldBlob = try parent.map { try Self.blobID(repo: repo, commitOID: $0, path: path) } ?? nil
+                guard blob != oldBlob else { continue }
+                defer { seen += 1 }
+                guard seen >= max(0, skip) else { continue }
+                let source = blob == nil ? parent.map { oidToHex($0) } : oidToHex(&oid)
+                guard let source else { continue }
+                let author = git_commit_author(commit)
+                result.append(GitCommitSummary(oid: source, shortOID: String(source.prefix(7)),
+                    message: git_commit_summary(commit).map { String(cString: $0) } ?? "Saved version",
+                    authorName: author?.pointee.name.map { String(cString: $0) } ?? "",
+                    authorEmail: author?.pointee.email.map { String(cString: $0) } ?? "",
+                    authoredDate: Self.dateFromSignature(author)))
+            }
+            return result
+        }.value
+    }
+    private static func recoveryCopies(repo: OpaquePointer?, path: String? = nil) throws -> [(path: String, summary: GitCommitSummary)] {
+        let folder = try safetyURL(repo: repo).deletingLastPathComponent()
+        return try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.creationDateKey, .isSymbolicLinkKey]).compactMap { directory in
+            guard UUID(uuidString: directory.lastPathComponent) != nil,
+                  try directory.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else { return nil }
+            guard FileManager.default.fileExists(atPath: directory.appendingPathComponent("content").path),
+                  let source = try? String(contentsOf: directory.appendingPathComponent("source"), encoding: .utf8),
+                  path == nil || path == source else { return nil }
+            let date = try directory.resourceValues(forKeys: [.creationDateKey]).creationDate ?? .distantPast
+            return (source, GitCommitSummary(oid: "copy:" + directory.lastPathComponent, shortOID: "Local copy", message: "Protected before restoration", authorName: "", authorEmail: "", authoredDate: date))
+        }.sorted { $0.summary.authoredDate > $1.summary.authoredDate }
+    }
+    private static func recoveryBytes(path: String, source: String, repo: OpaquePointer?) throws -> Data {
+        if source.hasPrefix("copy:") {
+            let identifier = String(source.dropFirst(5))
+            guard UUID(uuidString: identifier) != nil,
+                  try recoveryCopies(repo: repo, path: path).contains(where: { $0.summary.oid == source }) else {
+                throw LocalGitError.repositoryCorrupted("Choose a protected copy of this note")
+            }
+            let file = try safetyURL(repo: repo).deletingLastPathComponent().appendingPathComponent(identifier).appendingPathComponent("content")
+            guard try file.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else { throw LocalGitError.repositoryCorrupted("Recovery copy uses a symbolic link") }
+            return try Data(contentsOf: file)
+        }
+        var oid = git_oid(); try git2Check(git_oid_fromstr(&oid, source), context: "Read selected checkpoint")
+        guard let identifier = try blobID(repo: repo, commitOID: &oid, path: path) else { throw LocalGitError.repositoryCorrupted("The note is absent from this checkpoint") }
+        return try blobBytes(repo: repo, identifier: identifier)
+    }
+    private static func recoveryPreview(path: String, commit: String, repo: OpaquePointer?) throws -> NoteRecoveryPreview {
+        let file = try guardedFile(path, repo: repo)
+        let manifest = try readSafety(repo: repo)
+        let fingerprint = try safetyFingerprint(paths: [path], repo: repo, manifest: manifest)
+        let historical = try ProtectedNoteText.decode(recoveryBytes(path: path, source: commit, repo: repo))
+        let current = FileManager.default.fileExists(atPath: file.path) ? try ProtectedNoteText.decode(Data(contentsOf: file)) : ""
+        guard ProtectedNoteText.lines(current).count * ProtectedNoteText.lines(historical).count <= 4_000_000 else {
+            throw LocalGitError.repositoryCorrupted("This comparison is too large for selective recovery. Use whole-file recovery.")
+        }
+        guard try safetyFingerprint(paths: [path], repo: repo, manifest: readSafety(repo: repo)) == fingerprint else {
+            throw LocalGitError.repositoryCorrupted("The note changed. Open its preview again.")
+        }
+        return NoteRecoveryPreview(path: path, commit: commit, fingerprint: fingerprint,
+            current: current.replacingOccurrences(of: "\r\n", with: "\n"), historical: historical.replacingOccurrences(of: "\r\n", with: "\n"))
+    }
+    func recoveryPreview(path: String, commit: String) async throws -> NoteRecoveryPreview {
+        let location = localURL
+        return try await Task.detached {
+            var repo: OpaquePointer?; defer { if let repo { git_repository_free(repo) } }
+            try git2Check(git_repository_open(&repo, location.path), context: "Open recovery preview")
+            return try Self.recoveryPreview(path: path, commit: commit, repo: repo)
+        }.value
+    }
+    func restoreSelection(preview: NoteRecoveryPreview, selected: Set<Int>) async throws {
+        let location = localURL
+        try await Task.detached {
+            var repo: OpaquePointer?; defer { if let repo { git_repository_free(repo) } }
+            try git2Check(git_repository_open(&repo, location.path), context: "Open selective recovery")
+            guard git_repository_state(repo) == 0 else { throw LocalGitError.repositoryCorrupted("Finish the current combine before recovering text.") }
+            let latest = try Self.recoveryPreview(path: preview.path, commit: preview.commit, repo: repo)
+            guard latest.fingerprint == preview.fingerprint else { throw LocalGitError.repositoryCorrupted("The note changed. Review its latest version first.") }
+            let draft = latest.draft
+            guard !selected.isEmpty, selected.isSubset(of: Set(draft.changes.map(\.id))) else { throw LocalGitError.repositoryCorrupted("Select changes to restore") }
+            let choices = Dictionary(uniqueKeysWithValues: draft.changes.map { ($0.id, selected.contains($0.id) ? ConflictMergeDraft.Choice.server : .phone) })
+            guard let text = draft.result(choices: choices) else { throw LocalGitError.repositoryCorrupted("The selected changes cannot be restored") }
+            try Self.backupWorkingFile(preview.path, repo: repo)
+            var manifest = try Self.readSafety(repo: repo)
+            guard try Self.safetyFingerprint(paths: [preview.path], repo: repo, manifest: manifest) == preview.fingerprint else { throw LocalGitError.repositoryCorrupted("The note changed. Review it again.") }
+            let file = try Self.guardedFile(preview.path, repo: repo)
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: file, options: .atomic)
+            var index: OpaquePointer?; defer { if let index { git_index_free(index) } }
+            try git2Check(git_repository_index(&index, repo), context: "Read restored note index")
+            try git2Check(git_index_add_bypath(index, preview.path), context: "Record restored note")
+            try git2Check(git_index_write(index), context: "Save restored note index")
+            let identifier = try Self.workingBlobID(preview.path, repo: repo)
+            manifest.incoming.removeAll { $0.path == preview.path }
+            if let identifier { manifest.incoming.append(ReceivedFile(path: preview.path, expected: identifier, previous: nil)) }
+            manifest.approval = nil; manifest.approved = nil
+            try Self.writeSafety(manifest, repo: repo)
+        }.value
     }
 }

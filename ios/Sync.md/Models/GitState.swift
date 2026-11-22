@@ -43,3 +43,14 @@ struct GitState: Codable, Equatable {
         try? FileManager.default.removeItem(at: legacyFileURL)
     }
 }
+
+
+extension GitState {
+    var saveStatusTimes: String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .long
+        func label(_ date: Date?) -> String { date.map { formatter.string(from: $0) } ?? "not yet verified" }
+        return "Saved locally at: \(label(localCheckpointDate))\nServer verified at: \(label(lastVerifiedDate))"
+    }
+}

@@ -317,6 +317,11 @@ final class SerializedGitRepository: GitRepositoryProtocol, @unchecked Sendable 
         try await run { try await $0.commitDetail(oid: oid) }
     }
 
+    func recoveryNotes() async throws -> [String] { try await run { try await $0.recoveryNotes() } }
+    func noteHistory(path: String, limit: Int, skip: Int) async throws -> [GitCommitSummary] { try await run { try await $0.noteHistory(path: path, limit: limit, skip: skip) } }
+    func recoveryPreview(path: String, commit: String) async throws -> NoteRecoveryPreview { try await run { try await $0.recoveryPreview(path: path, commit: commit) } }
+    func restoreSelection(preview: NoteRecoveryPreview, selected: Set<Int>) async throws { try await run { try await $0.restoreSelection(preview: preview, selected: selected) } }
+
     func restoreFile(path: String, from commit: String) async throws {
         try await run { try await $0.restoreFile(path: path, from: commit) }
     }

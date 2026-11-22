@@ -8453,3 +8453,81 @@ private final class SerializationProbeRepository: GitRepositoryProtocol, @unchec
     func commitDetail(oid: String) async throws -> GitCommitDetail { fatalError() }
     func repoInfo() async throws -> LocalRepoInfo { fatalError() }
 }
+
+extension SyncMDTests {
+    func testProtectedTextCountsRepeatedLinesAndIgnoresLineEndingConversion() throws {
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "a\na\n🧘\n", current: "a\n🧘"), ["a"])
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "a\nb\n", current: "b\r\na"), [])
+        XCTAssertEqual(ProtectedNoteText.missing(expected: "- [ ] shower\n", current: "- [x] shower\n"), ["- [ ] shower"])
+        XCTAssertThrowsError(try ProtectedNoteText.decode(Data([0xff])))
+    }
+
+    func testPersistentIncomingProtectionReviewsPartialLossAcrossUnrelatedMergeAndRestart() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("PersistentProtection-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var raw: OpaquePointer?; XCTAssertEqual(git_repository_init(&raw, root.path, 0), 0); git_repository_free(raw)
+        let service = LocalGitService(localURL: root)
+        func write(_ name: String, _ text: String) throws { try Data(text.utf8).write(to: root.appendingPathComponent(name)) }
+        try write("Today.md", "header\ncontext\n- [ ] shower\n")
+        try await service.stageAll(); _ = try await commitLocalFixtureChanges(using: service, message: "Base")
+        let branch = try await service.repoInfo().branch
+        try await service.createBranch(name: "incoming-time"); try await service.switchBranch(name: "incoming-time")
+        try write("Today.md", "header\nFinished practices at 12:00\ncontext\n- [ ] shower\n")
+        try await service.stageAll(); _ = try await commitLocalFixtureChanges(using: service, message: "Time")
+        try await service.switchBranch(name: branch)
+        _ = try await service.mergeBranch(name: "incoming-time", authorName: "Test", authorEmail: "test@example.invalid")
+        try await service.createBranch(name: "unrelated"); try await service.switchBranch(name: "unrelated")
+        try write("Other.md", "independent note\n")
+        try await service.stageAll(); _ = try await commitLocalFixtureChanges(using: service, message: "Unrelated")
+        try await service.switchBranch(name: branch)
+        _ = try await service.mergeBranch(name: "unrelated", authorName: "Test", authorEmail: "test@example.invalid")
+        let reopened = LocalGitService(localURL: root)
+        try write("Today.md", "header\ncontext\n- [x] shower\n")
+        var review: SyncSafetyReview?
+        do { try await reopened.stageAll(); XCTFail("Missing time must stop even with another edit") }
+        catch LocalGitError.suspiciousChanges(let value) { review = value }
+        let decision = try XCTUnwrap(review)
+        XCTAssertTrue(decision.details?.contains { $0.removed.contains("Finished practices at 12:00") } == true)
+        try write("Today.md", "header\ncontext\n- [x] shower\nnewer edit\n")
+        do { try await reopened.reviewSafetyChanges(approve: true, review: decision); XCTFail("Stale approval") }
+        catch LocalGitError.repositoryCorrupted { }
+        do { try await reopened.stageAll(); XCTFail("Still needs review") }
+        catch LocalGitError.suspiciousChanges(let fresh) { try await reopened.reviewSafetyChanges(approve: true, review: fresh) }
+        try await reopened.stageAll()
+        _ = try await commitLocalFixtureChanges(using: reopened, message: "Explicitly approved")
+        try await reopened.stageAll()
+        try FileManager.default.removeItem(at: root.appendingPathComponent("Other.md"))
+        do { try await reopened.stageAll(); XCTFail("Unrelated received file retains protection") }
+        catch LocalGitError.suspiciousChanges(let value) { XCTAssertTrue(value.paths.contains("Other.md")) }
+    }
+
+    func testSelectiveNoteRecoveryKeepsNewerCheckboxAndRejectsStalePreview() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("SelectiveRecovery-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var raw: OpaquePointer?; XCTAssertEqual(git_repository_init(&raw, root.path, 0), 0); git_repository_free(raw)
+        let service = LocalGitService(localURL: root)
+        let file = root.appendingPathComponent("Today.md")
+        try Data("header\nTime 12:00\ncontext\n- [ ] shower\n".utf8).write(to: file)
+        try await service.stageAll(); let oid = try await commitLocalFixtureChanges(using: service, message: "Time")
+        try Data("header\ncontext\n- [x] shower\n".utf8).write(to: file)
+        let notes = try await service.recoveryNotes(); XCTAssertTrue(notes.contains("Today.md"))
+        let history = try await service.noteHistory(path: "Today.md", limit: 50, skip: 0); XCTAssertFalse(history.isEmpty)
+        let preview = try await service.recoveryPreview(path: "Today.md", commit: oid)
+        let selected = Set(preview.draft.changes.filter { $0.server.contains("Time 12:00") }.map(\.id))
+        try Data("header\ncontext\n- [x] shower\nnew edit\n".utf8).write(to: file)
+        do { try await service.restoreSelection(preview: preview, selected: selected); XCTFail("Stale preview") }
+        catch LocalGitError.repositoryCorrupted { }
+        let fresh = try await service.recoveryPreview(path: "Today.md", commit: oid)
+        try await service.restoreSelection(preview: fresh, selected: Set(fresh.draft.changes.filter { $0.server.contains("Time 12:00") }.map(\.id)))
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "header\nTime 12:00\ncontext\n- [x] shower\nnew edit\n")
+        let recoveredHistory = try await service.noteHistory(path: "Today.md", limit: 50, skip: 0)
+        let copy = try XCTUnwrap(recoveredHistory.first { $0.oid.hasPrefix("copy:") })
+        let copyPreview = try await service.recoveryPreview(path: "Today.md", commit: copy.oid)
+        XCTAssertTrue(copyPreview.historical.contains("new edit"))
+        let beforeCommit = try await service.repoInfo(); XCTAssertEqual(beforeCommit.commitSHA, oid, "Recovery does not create or upload a commit")
+        try await service.stageAll()
+        _ = try await commitLocalFixtureChanges(using: service, message: "Recovered selected text")
+    }
+}

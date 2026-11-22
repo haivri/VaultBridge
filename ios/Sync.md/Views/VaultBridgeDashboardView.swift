@@ -179,11 +179,11 @@ struct VaultBridgeDashboardView: View {
 
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(attentionCount(repo.id) > 0 ? "Files need your choice" : syncStatus.message)
+                    Text(attentionCount(repo.id) > 0 ? "Files need your choice" : (state.changeCounts[repo.id] ?? 0) > 0 && !syncStatus.isRunning ? "New edits are waiting to sync" : syncStatus.message)
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(statusColor(syncStatus.phase))
                         .lineLimit(2)
-                    Text(lastSyncText(repo))
+                    Text(repo.gitState.saveStatusTimes)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

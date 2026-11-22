@@ -106,6 +106,35 @@ final class SyncMDUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["File restored on this iPhone. Sync when you’re ready to upload it."].waitForExistence(timeout: 10))
     }
 
+    func testMissingTimestampReviewAndSelectiveRecovery() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-SyncSafetyUITest", "-SyncRecoveryUITest"]
+        app.launch()
+        let next = app.buttons["vault.nextAction"]
+        if !next.waitForExistence(timeout: 5) {
+            let open = app.buttons["Review"].firstMatch
+            XCTAssertTrue(open.waitForExistence(timeout: 20)); open.tap()
+        }
+        XCTAssertTrue(next.waitForExistence(timeout: 10)); next.tap()
+        let choose = app.buttons["Choose text to restore"]
+        XCTAssertTrue(choose.waitForExistence(timeout: 10)); choose.tap()
+        let version = app.buttons["recovery.version.0"]
+        XCTAssertTrue(version.waitForExistence(timeout: 10)); version.tap()
+        let toggle = app.switches.matching(NSPredicate(format: "identifier BEGINSWITH 'recovery.change.'")).firstMatch
+        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "1", "The timestamp change must be selected before restoring")
+        let preview = app.staticTexts["recovery.result"]
+        for _ in 0..<5 where !preview.isHittable { app.swipeUp() }
+        XCTAssertTrue(preview.label.contains("Time 12:00"))
+        XCTAssertTrue(preview.label.contains("[x] shower"))
+        let attachment = XCTAttachment(screenshot: app.screenshot()); attachment.name = "Selective timestamp recovery"; attachment.lifetime = .keepAlways; add(attachment)
+        let restore = app.buttons["Restore selected changes"]
+        for _ in 0..<4 where !restore.isHittable { app.swipeUp() }
+        restore.tap()
+        XCTAssertTrue(app.staticTexts["Restored locally. Your previous file is protected. Sync when ready to upload."].waitForExistence(timeout: 10))
+    }
+
     func testLaunch() {
         let app = XCUIApplication()
         app.launch()
